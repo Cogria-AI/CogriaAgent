@@ -1,0 +1,22 @@
+{
+  "name": "create-cogria-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Scaffold a new CogriaAgent project (backend actions + docker-compose + UI wiring).",
+  "type": "module",
+  "bin": {
+    "create-cogria-agent": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "templates"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "echo \"(create-cogria-agent: nothing to build)\"",
+    "lint": "echo \"(noop)\"",
+    "type-check": "echo \"(noop)\""
+  }
+}

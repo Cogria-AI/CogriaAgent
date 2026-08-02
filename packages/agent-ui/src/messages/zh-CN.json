@@ -1,0 +1,18 @@
+{
+  "chat": {
+    "welcomeTitle": "有什么可以帮你?",
+    "welcomeSubtitle": "随便问,或者交给我一个任务。",
+    "placeholder": "发条消息……",
+    "attach": "上传文件",
+    "uploading": "正在上传 {count} 个文件……"
+  },
+  "confirm": {
+    "title": "确认操作",
+    "confirm": "确认",
+    "cancel": "取消"
+  },
+  "artifacts": {
+    "reopen": "展开面板 ({count})",
+    "generating": "生成中……"
+  }
+}

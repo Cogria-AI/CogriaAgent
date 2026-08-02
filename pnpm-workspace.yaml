@@ -1,0 +1,4 @@
+packages:
+  - 'packages/agent-ui'
+  - 'packages/create-cogria-agent'
+  - 'examples/*'

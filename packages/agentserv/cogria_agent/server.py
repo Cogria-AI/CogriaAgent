@@ -1,0 +1,509 @@
+"""CogriaAgent orchestration service — build_app() wires the kernel to the seams.
+
+Runs as a private service (e.g. 127.0.0.1:8001), called only by the BFF. The BFF
+puts a JWT (minted by the business backend's /agent-auth/exchange) in the
+Authorization header; we verify it locally (shared HS256 secret). No tenant
+dimension — single-tenant by design.
+
+Nothing here is domain-specific: catalog, persistence and execution all sit
+behind the injected seams in protocols.py, and app name / issuer / required
+claims / model / prompt come from AgentConfig.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+import jwt
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+
+from . import summarizer
+from .artifacts import artifact_tool_names, build_artifact_tools
+from .attachments import (
+    ATTACHMENT_GUIDANCE,
+    AttachmentRejected,
+    Budget,
+    build_turn_content,
+    hydrate_history,
+)
+from .config import AgentConfig
+from .graph import build_graph, history_to_messages
+from .llm import ConfigSystemPromptProvider, DefaultLLMFactory
+from .protocols import (
+    ActionExecutor,
+    AttachmentRepository,
+    AttachmentStore,
+    CatalogProvider,
+    ConversationBackend,
+    DocumentExtractor,
+    SystemPromptProvider,
+)
+from .sse import extract_proposal, sse
+from .tools import build_tools_from_catalog
+
+logger = logging.getLogger("cogria.agentserv")
+
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def build_app(
+    config: AgentConfig,
+    *,
+    conversation_backend: ConversationBackend,
+    action_executor: ActionExecutor,
+    catalog_provider: CatalogProvider,
+    llm_factory: Any | None = None,
+    prompt_provider: SystemPromptProvider | None = None,
+    attachment_store: AttachmentStore | None = None,
+    attachment_repo: AttachmentRepository | None = None,
+    document_extractor: DocumentExtractor | None = None,
+) -> FastAPI:
+    """Construct the FastAPI app, binding the four required seams (+ optional
+    LLM/prompt providers, which default to config-driven implementations).
+
+    Passing `attachment_store` + `attachment_repo` switches on file uploads: the
+    /attachments routes get mounted and /chat starts accepting `attachment_ids`.
+    Omit them and the service behaves exactly as it did before attachments
+    existed. `document_extractor` defaults to DefaultDocumentExtractor.
+    """
+
+    llm_factory = llm_factory or DefaultLLMFactory(config)
+    prompt_provider = prompt_provider or ConfigSystemPromptProvider(config)
+
+    attachment_service = None
+    if attachment_store is not None and attachment_repo is not None:
+        from .attachments import AttachmentService, DefaultDocumentExtractor
+
+        attachment_service = AttachmentService(
+            store=attachment_store,
+            repo=attachment_repo,
+            extractor=document_extractor
+            or DefaultDocumentExtractor(
+                timeout_seconds=config.attachments.extract_timeout_seconds,
+                max_uncompressed_bytes=config.attachments.max_uncompressed_bytes,
+                max_zip_entries=config.attachments.max_zip_entries,
+            ),
+            config=config.attachments,
+        )
+    elif attachment_store is not None or attachment_repo is not None:
+        raise ValueError("attachments need BOTH attachment_store and attachment_repo")
+
+    if not config.auth.jwt_secret:
+        logger.warning("JWT_SECRET is empty; JWT verification will reject all requests.")
+
+    app = FastAPI(
+        title=config.app_name,
+        version="0.0.0",
+        docs_url="/docs" if config.env == "dev" else None,
+        redoc_url=None,
+    )
+
+    def verify_jwt(authorization: str = Header(default="")) -> dict:
+        if not config.auth.jwt_secret:
+            raise HTTPException(500, "JWT secret not configured")
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(401, "missing bearer token")
+        token = authorization[7:]
+        try:
+            return jwt.decode(
+                token,
+                config.auth.jwt_secret,
+                algorithms=["HS256"],
+                issuer=config.auth.jwt_issuer,
+                options={"require": config.auth.required_claims},
+            )
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(401, "token expired")
+        except jwt.InvalidIssuerError:
+            raise HTTPException(401, "invalid issuer")
+        except jwt.InvalidTokenError as e:
+            raise HTTPException(401, f"invalid token: {e}")
+
+    @app.get("/health")
+    def health() -> dict:
+        return {
+            "ok": True,
+            "service": config.app_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "attachments": attachment_service is not None,
+        }
+
+    if attachment_service is not None:
+        from .attachments import build_attachment_router
+
+        app.include_router(build_attachment_router(attachment_service, verify_jwt))
+
+    @app.get("/debug/whoami")
+    def whoami(claims: dict = Depends(verify_jwt)) -> dict:
+        return {"sub": claims.get("sub"), "role": claims.get("role"), "locale": claims.get("locale")}
+
+    @app.post("/chat")
+    async def chat(request: Request, claims: dict = Depends(verify_jwt)) -> StreamingResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "invalid json")
+
+        user_message = (body.get("message") or "").strip()
+        if not user_message:
+            raise HTTPException(422, "message is required")
+
+        conversation_id = body.get("conversation_id")
+        if conversation_id is not None:
+            try:
+                conversation_id = int(conversation_id)
+            except (TypeError, ValueError):
+                raise HTTPException(422, "conversation_id must be an integer")
+
+        # Propose/confirm follow-up (MVP-A): the [CONFIRMED] turn carries the
+        # proposal_token; feed the LLM an augmented message so it re-supplies the
+        # token, while the persisted user row keeps the clean keyword.
+        proposal_token = (body.get("proposal_token") or "").strip()
+        llm_message = user_message
+        if proposal_token and user_message == "[CONFIRMED]":
+            llm_message = f"[CONFIRMED] proposal_token={proposal_token}"
+        elif user_message == "[CANCELLED]":
+            llm_message = "[CANCELLED]"
+
+        locale = claims.get("locale")
+        owner_sub = str(claims.get("sub") or "")
+
+        # Files the user attached to THIS message (uploaded beforehand via
+        # /attachments). Resolving proves they exist and belong to the caller.
+        attachment_ids = [str(i) for i in (body.get("attachment_ids") or []) if i]
+        if attachment_ids and attachment_service is None:
+            raise HTTPException(501, "attachments are not enabled on this server")
+        records: list[dict[str, Any]] = []
+        if attachment_ids:
+            try:
+                records = await attachment_service.resolve(attachment_ids, owner_sub=owner_sub)
+            except AttachmentRejected as e:
+                raise HTTPException(e.status_code, e.message) from e
+
+        # Artifact tools come from the front-end registry via the BFF; advertised
+        # to the LLM but dispatched as no-ops (the tool_call event IS the render).
+        artifact_defs = body.get("artifact_tools") or []
+        artifact_names = artifact_tool_names(artifact_defs)
+
+        # Per-request identity for the executor (the LLM never sees this).
+        bearer = request.headers.get("authorization", "")
+        req_context = {"claims": claims, "bearer": bearer}
+
+        # What actually gets persisted for the user's turn: the clean text plus
+        # a lightweight reference to each file (the extracted text stays in the
+        # attachment record — one copy, not one per message).
+        user_content: dict[str, Any] = {"text": user_message}
+        if records:
+            user_content["attachments"] = [
+                {
+                    "id": r["id"],
+                    "name": r["filename"],
+                    "mime": r["mime"],
+                    "size": r["size_bytes"],
+                    "kind": r["kind"],
+                }
+                for r in records
+            ]
+
+        is_new = conversation_id is None
+        if is_new:
+            conversation_id = await conversation_backend.create_conversation(
+                first_message=user_message,
+                model=llm_factory.model_name(),
+                first_content=user_content,
+            )
+            prior: list[dict[str, Any]] = []
+        else:
+            prior = await conversation_backend.fetch_history(conversation_id, for_llm=True)
+            # Persist the user's message NOW rather than at flush: if the client
+            # navigates away mid-run, a history fetch must still show this turn.
+            await conversation_backend.append_messages(
+                conversation_id,
+                messages=[{"role": "user", "content": user_content}],
+                usage=None,
+                model=None,
+            )
+
+        # One character budget for the whole request, spent on this turn first
+        # so the newest document always gets its full allowance.
+        turn_content: Any = llm_message
+        if attachment_service is not None:
+            budget = Budget(config.attachments.max_chars_total, config.attachments.max_chars_per_doc)
+            vision_enabled = attachment_service.vision_enabled
+            turn_content = await build_turn_content(
+                text=llm_message,
+                records=records,
+                service=attachment_service,
+                budget=budget,
+                vision_enabled=vision_enabled,
+            )
+            if prior:
+                prior = await hydrate_history(
+                    prior,
+                    service=attachment_service,
+                    config=config.attachments,
+                    budget=budget,
+                    vision_enabled=vision_enabled,
+                    owner_sub=owner_sub,
+                )
+
+        initial_messages = history_to_messages(prior)
+        initial_messages.append(HumanMessage(content=turn_content))
+
+        # Images (this turn or replayed) require the configured vision model;
+        # everything else stays on the default one.
+        model_override = (
+            config.attachments.vision_model if _contains_image(initial_messages) else None
+        )
+        prompt_suffix = ATTACHMENT_GUIDANCE if (records or _has_attachments(prior)) else ""
+
+        catalog = await catalog_provider.get_catalog()
+        tools = build_tools_from_catalog(catalog, executor=action_executor, context=req_context)
+        tools = tools + build_artifact_tools(artifact_defs)
+        graph = build_graph(
+            tools,
+            llm_factory=llm_factory,
+            prompt_provider=prompt_provider,
+            locale=locale,
+            max_turns=config.graph.max_turns,
+            prompt_suffix=prompt_suffix,
+            model_override=model_override,
+        )
+
+        logger.info(
+            "chat user=%s conv=%s new=%s tools=%s prior=%d attachments=%d model=%s",
+            claims.get("sub"), conversation_id, is_new, [t.name for t in tools], len(prior),
+            len(records), model_override or llm_factory.model_name(),
+        )
+
+        acc: dict[str, Any] = {
+            "assistant_text": "",
+            "pending_calls": {},
+            "tool_results": [],
+            "resolved_call_ids": set(),
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "stream_error": None,
+            "flushed": False,
+        }
+
+        async def flush_turn() -> None:
+            """Persist the accumulated turn exactly once, decoupled from the
+            client (a disconnect cancels the generator, but the reply must land)."""
+            if acc["flushed"]:
+                return
+            acc["flushed"] = True
+            try:
+                await _persist_turn(
+                    backend=conversation_backend,
+                    conversation_id=conversation_id,
+                    acc=acc,
+                    artifact_names=artifact_names,
+                    model=llm_factory.model_name(),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("persist turn failed conv=%s: %s", conversation_id, e)
+
+            if config.summarizer.enabled:
+                try:
+                    asyncio.create_task(
+                        summarizer.maybe_summarize(
+                            backend=conversation_backend,
+                            llm_factory=llm_factory,
+                            config=config.summarizer,
+                            conversation_id=conversation_id,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # The graph runs in its own task, decoupled from the SSE generator: a
+        # client disconnect (page navigation away) cancels only the generator,
+        # while the turn runs to completion and persists via flush_turn. Without
+        # this, leaving mid-generation killed the LLM run and stored a truncated
+        # assistant message.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def run_graph():
+            try:
+                try:
+                    async for event in graph.astream_events(
+                        {"messages": initial_messages, "turns": 0}, version="v2"
+                    ):
+                        kind = event.get("event")
+                        if kind == "on_chat_model_stream":
+                            chunk = event["data"].get("chunk")
+                            if isinstance(chunk, AIMessageChunk) and chunk.content:
+                                acc["assistant_text"] += chunk.content
+                                await queue.put(sse("text", {"delta": chunk.content}))
+                        elif kind == "on_chat_model_end":
+                            out = event["data"].get("output")
+                            if isinstance(out, (AIMessage, AIMessageChunk)):
+                                usage = getattr(out, "usage_metadata", None) or {}
+                                acc["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+                                acc["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+                                for call in getattr(out, "tool_calls", []) or []:
+                                    acc["pending_calls"][call["id"]] = {
+                                        "name": call["name"],
+                                        "args": call.get("args", {}),
+                                    }
+                                    await queue.put(sse(
+                                        "tool_call",
+                                        {"id": call["id"], "name": call["name"], "args": call.get("args", {})},
+                                    ))
+                        elif kind == "on_tool_end":
+                            output = event["data"].get("output")
+                            name = event.get("name") or ""
+                            content = output.content if isinstance(output, ToolMessage) else str(output)
+                            # Pair by name with the first unresolved pending call —
+                            # tool_calls and on_tool_end arrive in order.
+                            tool_call_id = None
+                            for cid, c in acc["pending_calls"].items():
+                                if c["name"] == name and cid not in acc["resolved_call_ids"]:
+                                    tool_call_id = cid
+                                    acc["resolved_call_ids"].add(cid)
+                                    break
+                            acc["tool_results"].append(
+                                {"tool_call_id": tool_call_id, "name": name, "content": content}
+                            )
+                            proposal = extract_proposal(content)
+                            if proposal is not None:
+                                await queue.put(sse(
+                                    "confirm_required",
+                                    {
+                                        "proposal_token": proposal.get("proposal_token"),
+                                        "summary": proposal.get("summary", ""),
+                                        "action_name": name,
+                                    },
+                                ))
+                            elif name in artifact_names:
+                                pass  # the tool_call event already drove the panel
+                            else:
+                                await queue.put(
+                                    sse("tool_result", {"name": name, "content": content})
+                                )
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("chat stream failed: %s", e)
+                    acc["stream_error"] = f"{type(e).__name__}: {e}"
+                    await queue.put(sse("error", {"message": acc["stream_error"]}))
+            finally:
+                # Persist BEFORE emitting done: when the client sees the turn
+                # finish, a history fetch must already include it.
+                await flush_turn()
+                await queue.put(sse("done", {"conversation_id": conversation_id}))
+                await queue.put(None)
+
+        graph_task = asyncio.ensure_future(run_graph())
+        _BACKGROUND_TASKS.add(graph_task)
+        graph_task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+        async def event_stream():
+            yield sse("ready", {"tools": [t.name for t in tools]})
+            yield sse("conversation", {"conversation_id": conversation_id, "new": is_new})
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    return app
+
+
+def _contains_image(messages: list[Any]) -> bool:
+    """True if any message carries a multimodal image block — the signal to
+    route this request to the vision model."""
+    for msg in messages:
+        content = getattr(msg, "content", None)
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "image_url" for b in content
+        ):
+            return True
+    return False
+
+
+def _has_attachments(rows: list[dict[str, Any]]) -> bool:
+    return any((r.get("content") or {}).get("attachments") for r in rows)
+
+
+async def _persist_turn(
+    *,
+    backend: ConversationBackend,
+    conversation_id: Any,
+    acc: dict[str, Any],
+    artifact_names: set[str],
+    model: str | None,
+) -> None:
+    """Assemble the turn's assistant/tool messages and append them. The user
+    message is already persisted (create_conversation for a new conversation,
+    an up-front append for a continuation)."""
+    messages: list[dict[str, Any]] = []
+
+    pending_calls = acc["pending_calls"]
+    assistant_content: dict[str, Any] = {"text": acc["assistant_text"]}
+    tool_calls_meta: list[dict[str, Any]] = []
+    if pending_calls:
+        assistant_content["tool_calls"] = [
+            {"id": cid, "name": c["name"], "args": c["args"]} for cid, c in pending_calls.items()
+        ]
+        tool_calls_meta = [
+            {
+                "tool_call_id": cid,
+                "tool_name": c["name"],
+                "tool_type": "artifact" if c["name"] in artifact_names else "action",
+                "args": c["args"],
+                "status": "success",
+            }
+            for cid, c in pending_calls.items()
+        ]
+
+    stream_error = acc["stream_error"]
+    assistant_msg: dict[str, Any] = {
+        "role": "assistant",
+        "content": assistant_content,
+        "input_tokens": acc["input_tokens"] or None,
+        "output_tokens": acc["output_tokens"] or None,
+        "finish_reason": "error" if stream_error else ("tool_calls" if pending_calls else "stop"),
+    }
+    if stream_error:
+        assistant_msg["error"] = {"message": stream_error}
+    if tool_calls_meta:
+        assistant_msg["tool_calls"] = tool_calls_meta
+    assistant_index = len(messages)
+    messages.append(assistant_msg)
+
+    for tr in acc["tool_results"]:
+        result_payload: Any = tr["content"]
+        try:
+            result_payload = json.loads(tr["content"])
+        except (TypeError, ValueError):
+            pass
+        messages.append(
+            {
+                "role": "tool",
+                "content": {
+                    "tool_call_id": tr.get("tool_call_id"),
+                    "name": tr.get("name"),
+                    "result": result_payload,
+                },
+                "parent_index": assistant_index,
+            }
+        )
+
+    await backend.append_messages(
+        conversation_id,
+        messages=messages,
+        usage={"input_tokens": acc["input_tokens"], "output_tokens": acc["output_tokens"]},
+        model=model,
+    )

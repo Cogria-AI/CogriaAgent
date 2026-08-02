@@ -1,0 +1,25 @@
+[project]
+name = "__PROJECT_NAME__-agent"
+version = "0.0.0"
+description = "__PROJECT_NAME__ — CogriaAgent backend (business actions + kernel wiring)."
+requires-python = ">=3.11"
+dependencies = [
+    "cogria-agentserv",
+    "cogria-backend",
+    "uvicorn[standard]>=0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# Pre-publish: resolve the framework from your local CogriaAgent checkout.
+# Once cogria-* are on PyPI (C6), delete this whole section — the plain
+# dependencies above will resolve from the index.
+[tool.uv.sources]
+cogria-contract = { path = "__FRAMEWORK_PATH__/packages/contract", editable = true }
+cogria-backend = { path = "__FRAMEWORK_PATH__/packages/backend-py", editable = true }
+cogria-agentserv = { path = "__FRAMEWORK_PATH__/packages/agentserv", editable = true }

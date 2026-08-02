@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Env / secrets
+.env
+.env.local
+web/.env.local
+
+# Node / build
+node_modules/
+.next/

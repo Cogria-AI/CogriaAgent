@@ -1,0 +1,18 @@
+{
+  "chat": {
+    "welcomeTitle": "How can I help?",
+    "welcomeSubtitle": "Ask me anything, or give me a task to do.",
+    "placeholder": "Send a message…",
+    "attach": "Attach a file",
+    "uploading": "Uploading {count, plural, one {# file} other {# files}}…"
+  },
+  "confirm": {
+    "title": "Confirm action",
+    "confirm": "Confirm",
+    "cancel": "Cancel"
+  },
+  "artifacts": {
+    "reopen": "Show panel ({count})",
+    "generating": "Generating…"
+  }
+}

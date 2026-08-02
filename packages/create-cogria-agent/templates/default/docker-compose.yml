@@ -1,0 +1,59 @@
+# One command brings up the agent kernel + redis:  docker compose up
+# Add a database too:                               docker compose --profile postgres up
+#
+# The front-end (CogriaAgent agent-ui) runs separately — agentserv is a private
+# service; the BFF/UI is its only caller. See README "Run it (Docker)".
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  agentserv:
+    # Pre-publish: a plain Python image that installs the framework from your
+    # local checkout (mounted below) at startup. Post-publish, switch to
+    # `build: ./agent` with a Dockerfile that pip-installs cogria-agentserv.
+    image: python:3.12-slim
+    working_dir: /srv/agent
+    entrypoint: ["bash", "/srv/agent/docker-entrypoint.sh"]
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      AGENT_MODEL: ${AGENT_MODEL:-gpt-4o-mini}
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: redis://redis:6379/0
+      PYTHONPATH: /srv/agent
+    volumes:
+      - ./agent:/srv/agent
+      # The (not-yet-published) framework source. COGRIA_FRAMEWORK_PATH is set in
+      # .env by the scaffolder. Drop this mount once the packages are on PyPI.
+      - ${COGRIA_FRAMEWORK_PATH}:/srv/framework:ro
+    ports:
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Optional. Provided for when you switch the kernel's ConversationBackend from
+  # in-memory to Postgres-backed persistence. The sample app uses in-memory and
+  # does not require this service.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: cogria
+      POSTGRES_PASSWORD: cogria
+      POSTGRES_DB: cogria_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

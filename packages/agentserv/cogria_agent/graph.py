@@ -1,0 +1,203 @@
+"""Minimal LangGraph chat graph: LLM -> optional tool -> LLM -> END.
+
+The model can call any tool (action or artifact) in one or more rounds; we cap
+iterations to max_turns so a malformed tool loop can't burn budget. The system
+prompt + reply language come from a SystemPromptProvider, and the LLM from an
+LLMFactory — no business prompt or locale set is hardcoded here.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Annotated, Any, TypedDict
+
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import BaseTool
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+
+from .protocols import SystemPromptProvider
+
+
+class ChatState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    turns: int  # incremented before each LLM call; guards against > max_turns
+
+
+def build_graph(
+    tools: list[BaseTool],
+    *,
+    llm_factory: Any,
+    prompt_provider: SystemPromptProvider,
+    locale: str | None = None,
+    max_turns: int = 10,
+    prompt_suffix: str = "",
+    model_override: str | None = None,
+):
+    """`prompt_suffix` appends per-request guidance (e.g. how to treat attachment
+    content) without projects having to bake it into their own system prompt.
+    `model_override` swaps the chat model for this request only — used to route
+    a turn carrying images to a vision-capable model."""
+    llm = (
+        llm_factory.chat_llm(model=model_override) if model_override else llm_factory.chat_llm()
+    ).bind_tools(tools)
+    tools_by_name = {t.name: t for t in tools}
+    system_prompt = prompt_provider.system_prompt(locale=locale) + prompt_suffix
+
+    async def chat_node(state: ChatState) -> dict[str, Any]:
+        msgs = state["messages"]
+        if not msgs or not isinstance(msgs[0], SystemMessage):
+            msgs = [SystemMessage(content=system_prompt), *msgs]
+
+        accumulator: AIMessageChunk | None = None
+        async for chunk in llm.astream(msgs):
+            accumulator = chunk if accumulator is None else accumulator + chunk
+
+        final = (
+            AIMessage(
+                content=accumulator.content if accumulator else "",
+                tool_calls=getattr(accumulator, "tool_calls", []) or [],
+            )
+            if accumulator is not None
+            else AIMessage(content="")
+        )
+        return {"messages": [final], "turns": state.get("turns", 0) + 1}
+
+    async def tool_node(state: ChatState) -> dict[str, Any]:
+        last = state["messages"][-1]
+        results: list[ToolMessage] = []
+        for call in getattr(last, "tool_calls", []) or []:
+            tool = tools_by_name.get(call["name"])
+            if not tool:
+                results.append(
+                    ToolMessage(
+                        content=f'{{"ok":false,"error":{{"code":"UNKNOWN_TOOL","message":"No such tool: {call["name"]}"}}}}',
+                        tool_call_id=call["id"],
+                    )
+                )
+                continue
+            try:
+                payload = await tool.ainvoke(call["args"])
+            except Exception as e:  # noqa: BLE001 — tool failures must not crash the graph
+                payload = f'{{"ok":false,"error":{{"code":"TOOL_EXCEPTION","message":"{type(e).__name__}: {e}"}}}}'
+            results.append(ToolMessage(content=str(payload), tool_call_id=call["id"]))
+        return {"messages": results}
+
+    def route_after_chat(state: ChatState) -> str:
+        if state.get("turns", 0) >= max_turns:
+            return END
+        last = state["messages"][-1] if state["messages"] else None
+        if isinstance(last, AIMessage) and last.tool_calls:
+            return "tools"
+        return END
+
+    def route_after_tools(state: ChatState) -> str:
+        # Propose/confirm gate (MVP-A): if a write action just returned a proposal
+        # (dry_run), END the turn so the front-end can show the ConfirmCard rather
+        # than letting the LLM narrate the proposal before the user confirms.
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, ToolMessage):
+                if _is_proposal(msg.content):
+                    return END
+                break
+        return "chat"
+
+    graph = StateGraph(ChatState)
+    graph.add_node("chat", chat_node)
+    graph.add_node("tools", tool_node)
+    graph.set_entry_point("chat")
+    graph.add_conditional_edges("chat", route_after_chat, {"tools": "tools", END: END})
+    graph.add_conditional_edges("tools", route_after_tools, {"chat": "chat", END: END})
+    return graph.compile()
+
+
+def _is_proposal(content: Any) -> bool:
+    """True if a tool-result envelope is a propose (dry_run) response carrying a
+    proposal_token to confirm. Tolerant of non-JSON / unexpected shapes."""
+    try:
+        env = json.loads(content) if isinstance(content, str) else content
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(env, dict) or not env.get("ok"):
+        return False
+    data = env.get("data") or {}
+    return bool(isinstance(data, dict) and data.get("requires_confirm") and data.get("proposal_token"))
+
+
+def history_to_messages(rows: list[dict[str, Any]]) -> list[BaseMessage]:
+    """Convert persisted `for_llm` rows into LangChain messages for replay.
+
+    Persisted `content` shape:
+      user/system/assistant(text)  -> {"text": "..."}
+      user with attachments        -> {"text": "...", "attachments": [...], "blocks": [...]}
+      assistant(tool_calls)        -> {"text": "...", "tool_calls": [...]}
+      tool                         -> {"tool_call_id", "name", "result"}
+
+    `blocks` is not persisted — attachments.hydrate_history adds it just before
+    replay, carrying multimodal content (document text, image data) rebuilt from
+    the attachment store.
+
+    The OpenAI/DeepSeek API requires every assistant tool_call to be followed by
+    its matching tool message. Summarization can drop one side; to stay valid we
+    degrade an assistant tool_call to plain text when its tool response isn't in
+    this window, and we drop orphan tool messages.
+    """
+    answered: set[str] = set()
+    for m in rows:
+        if m.get("role") == "tool":
+            tcid = (m.get("content") or {}).get("tool_call_id")
+            if tcid:
+                answered.add(tcid)
+
+    out: list[BaseMessage] = []
+    emitted_calls: set[str] = set()
+    for m in rows:
+        role = m.get("role")
+        content = m.get("content") or {}
+        text = content.get("text", "") or ""
+
+        if role == "user":
+            out.append(HumanMessage(content=content.get("blocks") or text))
+        elif role == "system":
+            out.append(SystemMessage(content=text))
+        elif role == "assistant":
+            raw_calls = content.get("tool_calls") or []
+            valid = [c for c in raw_calls if c.get("id") in answered]
+            if valid:
+                out.append(
+                    AIMessage(
+                        content=text,
+                        tool_calls=[
+                            {
+                                "id": c["id"],
+                                "name": c["name"],
+                                # An empty {} round-trips through JSON as [];
+                                # AIMessage requires args to be a dict.
+                                "args": c["args"] if isinstance(c.get("args"), dict) else {},
+                            }
+                            for c in valid
+                        ],
+                    )
+                )
+                emitted_calls.update(c["id"] for c in valid)
+            else:
+                out.append(AIMessage(content=text))
+        elif role == "tool":
+            tcid = content.get("tool_call_id")
+            if tcid and tcid in emitted_calls:
+                result = content.get("result")
+                out.append(
+                    ToolMessage(
+                        content=json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result,
+                        tool_call_id=tcid,
+                    )
+                )
+            # else: orphan tool message -> drop
+    return out

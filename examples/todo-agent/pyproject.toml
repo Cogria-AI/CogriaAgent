@@ -1,0 +1,19 @@
+[project]
+name = "todo-agent-example"
+version = "0.0.0"
+description = "Non-restaurant example: a todo agent wiring in-memory backends into the CogriaAgent kernel."
+requires-python = ">=3.11"
+dependencies = [
+    "cogria-agentserv",
+    "uvicorn[standard]>=0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["todo_agent"]
+
+[tool.uv.sources]
+cogria-agentserv = { workspace = true }
