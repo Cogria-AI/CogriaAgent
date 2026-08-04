@@ -352,6 +352,34 @@ Roadmap: [`docs/roadmap.md`](./docs/roadmap.md).
 
 ---
 
+## Built on
+
+CogriaAgent is mostly wiring between excellent open-source projects. The load-bearing ones:
+
+| | |
+|---|---|
+| [LangGraph](https://github.com/langchain-ai/langgraph) · [LangChain Core](https://github.com/langchain-ai/langchain) | The tool loop and the message/tool abstractions the kernel streams over |
+| [FastAPI](https://github.com/fastapi/fastapi) · [Uvicorn](https://github.com/encode/uvicorn) · [Starlette](https://github.com/encode/starlette) | The kernel's HTTP surface and its SSE streaming |
+| [Pydantic](https://github.com/pydantic/pydantic) | Config, contract types, and the argument models synthesised from your JSON Schema |
+| [assistant-ui](https://github.com/assistant-ui/assistant-ui) | The chat runtime and primitives the front-end is built from |
+| [Next.js](https://github.com/vercel/next.js) · [React](https://github.com/facebook/react) | The app and BFF |
+| [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) · [Radix UI](https://github.com/radix-ui/primitives) · [Lucide](https://github.com/lucide-icons/lucide) | Styling, accessible primitives, icons |
+| [Recharts](https://github.com/recharts/recharts) | The builtin chart artifact renderer |
+| [SQLAlchemy](https://github.com/sqlalchemy/sqlalchemy) | Durable conversation storage (optional) |
+| [Zustand](https://github.com/pmndrs/zustand) · [next-intl](https://github.com/amannn/next-intl) · [ioredis](https://github.com/redis/ioredis) | Artifact panel state, i18n, the BFF's JWT cache |
+| [PyJWT](https://github.com/jpadilla/pyjwt) · [httpx](https://github.com/encode/httpx) · [tiktoken](https://github.com/openai/tiktoken) | Token verification, HTTP calls, token counting |
+| [MarkItDown](https://github.com/microsoft/markitdown) · [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | Office and PDF text extraction (optional) |
+
+Everything above is MIT, BSD, Apache-2.0 or ISC — **except PyMuPDF**, which is
+dual-licensed **AGPL-3.0 or commercial**.
+
+> **Note on the `attachments` extra.** PDF extraction pulls in PyMuPDF (via
+> `pymupdf4llm`), so installing that extra brings AGPL code into your
+> environment. CogriaAgent itself stays MIT and the extra is opt-in, but if AGPL
+> is a problem where you work, extraction sits behind the `DocumentExtractor`
+> seam — supply your own implementation over a permissively licensed parser and
+> nothing else changes. Everything except PDF works without it.
+
 ## Contributing
 
 Issues and pull requests are welcome — especially contract implementations in

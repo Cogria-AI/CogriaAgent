@@ -142,6 +142,26 @@ is the one who has to fix them:
 An unreadable file still appears in the transcript, marked unreadable, so the
 model can say so instead of inventing contents.
 
+## A licensing caveat on PDF extraction
+
+The `attachments` extra installs `pymupdf4llm`, which depends on **PyMuPDF —
+dual-licensed AGPL-3.0 or commercial**. Everything else CogriaAgent depends on
+is MIT, BSD, Apache-2.0 or ISC.
+
+CogriaAgent itself stays MIT and the extra is opt-in, so nothing here changes
+the framework's license. But AGPL carries network-copyleft obligations and plenty
+of organisations disallow it outright, so it is worth knowing before you ship.
+
+Two ways out if it matters to you:
+
+- **Skip PDF.** Word, Excel, PowerPoint, text, Markdown, CSV and JSON go through
+  MarkItDown (MIT). Install without `pymupdf4llm` and PDFs are reported as
+  unreadable rather than silently mishandled.
+- **Bring your own parser.** Extraction sits behind the `DocumentExtractor`
+  seam. Implement `extract(*, data, mime, filename)` over a permissively
+  licensed library and pass it to `build_app(document_extractor=…)`; nothing
+  else in the pipeline changes.
+
 ## Not yet implemented
 
 - `read_attachment(id, page_from, page_to)` — paging through a large document on

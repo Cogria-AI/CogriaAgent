@@ -255,6 +255,32 @@ export AGENT_VISION_MODEL=gpt-4o-mini                    # 传图片必需
 [附件](./docs/attachments.md) ·
 [路线图](./docs/roadmap.md)
 
+## 站在这些开源项目上
+
+CogriaAgent 很大程度上是把一批优秀开源项目接起来。承重的几个：
+
+| | |
+|---|---|
+| [LangGraph](https://github.com/langchain-ai/langgraph) · [LangChain Core](https://github.com/langchain-ai/langchain) | 工具循环，以及内核流式输出所依赖的消息/工具抽象 |
+| [FastAPI](https://github.com/fastapi/fastapi) · [Uvicorn](https://github.com/encode/uvicorn) · [Starlette](https://github.com/encode/starlette) | 内核的 HTTP 层与 SSE 流式 |
+| [Pydantic](https://github.com/pydantic/pydantic) | 配置、契约类型，以及由你的 JSON Schema 合成的参数模型 |
+| [assistant-ui](https://github.com/assistant-ui/assistant-ui) | 前端的聊天运行时与基础组件 |
+| [Next.js](https://github.com/vercel/next.js) · [React](https://github.com/facebook/react) | 应用与 BFF |
+| [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) · [Radix UI](https://github.com/radix-ui/primitives) · [Lucide](https://github.com/lucide-icons/lucide) | 样式、无障碍基础组件、图标 |
+| [Recharts](https://github.com/recharts/recharts) | 内置图表 artifact 渲染器 |
+| [SQLAlchemy](https://github.com/sqlalchemy/sqlalchemy) | 会话持久化（可选） |
+| [Zustand](https://github.com/pmndrs/zustand) · [next-intl](https://github.com/amannn/next-intl) · [ioredis](https://github.com/redis/ioredis) | Artifact 面板状态、i18n、BFF 的 JWT 缓存 |
+| [PyJWT](https://github.com/jpadilla/pyjwt) · [httpx](https://github.com/encode/httpx) · [tiktoken](https://github.com/openai/tiktoken) | 令牌校验、HTTP 调用、token 计数 |
+| [MarkItDown](https://github.com/microsoft/markitdown) · [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | Office 与 PDF 文本抽取（可选） |
+
+以上全部是 MIT / BSD / Apache-2.0 / ISC，**只有 PyMuPDF 例外** —— 它是
+**AGPL-3.0 与商业许可双授权**。
+
+> **关于 `attachments` 可选依赖。** PDF 抽取会经 `pymupdf4llm` 引入 PyMuPDF，
+> 也就是把 AGPL 代码带进你的环境。CogriaAgent 本身仍是 MIT，且这个 extra 是选装的；
+> 但如果你的公司对 AGPL 有顾虑，抽取这一步位于 `DocumentExtractor` 接缝之后 ——
+> 换成基于宽松许可解析器的自有实现即可，其余一律不动。除 PDF 外的格式不装它也能用。
+
 ## 参与贡献
 
 欢迎 issue 和 PR，尤其是其他语言的契约实现、新的 artifact renderer，以及真实接入
