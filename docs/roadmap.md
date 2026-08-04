@@ -37,24 +37,109 @@ backlog, so a returning client replays what it missed and then follows the rest
 live. Conversations are owned by the JWT subject and every read, continuation
 and replay is gated on it.
 
-## Planned
+## Where this is going
 
-**Cost governance.** Layered interception (rate limit at the BFF, pre-flight
-budget check in the kernel, turn count), token accounting written back per turn,
-usage aggregation, a quota endpoint contract, and a usage banner in the UI. Today
-`graph.max_turns` is the only runaway-cost guard.
+Ordered by what unblocks what, not by dates — this is a small project and a date
+in a public roadmap is a promise it cannot keep. Nothing below has code yet.
 
-**Operational governance.** Prompt versioning that does not require a restart, an
-eval harness with fixtures and scoring, full error-state coverage with reconnect,
-pluggable observability hooks, and a staged-rollout switch.
+Each horizon states why it comes before the next one. If you disagree with the
+ordering, that is a useful issue to open.
 
-**Progressive disclosure for tool descriptions.** Optional `SKILL.md`-style
-documents describing when to use a group of actions, injected only when relevant,
-so large catalogs do not bloat every prompt. Execution would still go through the
-catalog schema.
+### 1 · Be installable
 
-**Release engineering.** Published packages, CI running lint, tests and build,
-semantic versioning, and a documentation site.
+The one thing holding everything else back: today the only way to use CogriaAgent
+is to clone it.
+
+- Publish `cogria-agentserv`, `cogria-backend` and `cogria-contract` to PyPI, and
+  `@cogria/agent-ui` to npm
+- Semantic versioning, a changelog, and release automation in CI
+- Version the HTTP contract explicitly, so a backend can declare which revision
+  it implements and the conformance suite can check against it
+
+*Why first:* a framework you cannot install is a framework nobody adopts. It also
+forces anyone who wants it to copy the source, and a copy diverges from the day
+it is made — the fix for that is a versioned dependency, which needs a release.
+
+### 2 · Earn production trust
+
+The questions an operations team asks before anything reaches real users.
+
+- **Cost governance.** Per-turn token accounting written back to storage, budgets
+  enforced before a request runs, a quota endpoint contract, a kill switch, and a
+  usage banner in the UI. Today `graph.max_turns` is the only guard against a
+  runaway loop, and it counts turns rather than money.
+- **Observability.** OpenTelemetry spans stitched across BFF → kernel → your
+  backend, structured logs, and a pluggable error sink. Debugging a bad answer
+  currently means reading server logs by hand.
+- **Browser-level tests.** The resume path is covered thoroughly on the server
+  and not at all in a browser; the front-end has no test suite yet.
+- **Conformance in CI.** Run the contract suite against the examples on every
+  push, so the contract cannot drift from its reference implementations.
+
+### 3 · Scale past one process
+
+- Move the in-flight run registry off process memory (a shared event log plus
+  pub/sub) so resuming works behind more than one worker
+- Graceful shutdown that drains turns in flight instead of dropping them
+- Rate limiting at the BFF
+
+*Why here:* the single-worker assumption is the main thing between this and a
+deployment that can be restarted without losing replies mid-generation.
+
+### 4 · Meet the ecosystem where it is
+
+[MCP](https://modelcontextprotocol.io) has become the common way to expose tools
+to models — it moved to vendor-neutral governance under the Linux Foundation in
+late 2025 and is supported across every major model provider. CogriaAgent's
+`CatalogProvider` and `ActionExecutor` seams already have the right shape for it.
+
+- **Consume MCP.** An MCP-backed catalog provider and executor, so a backend that
+  already speaks MCP needs no CogriaAgent-specific endpoints at all
+- **Expose MCP.** Serve your action catalog as an MCP server, so the actions you
+  write here are reusable by other clients
+- **Keep the safety layer on top.** MCP has no human-approval primitive. Wrapping
+  MCP tools in propose/confirm — a summary a person reads, a one-shot token bound
+  to the parameters — is precisely what CogriaAgent adds over calling them
+  directly, and it should apply to an MCP tool exactly as it does to a native one
+
+*Why not sooner:* interoperability is worth more once the thing is installable and
+trustworthy. Done earlier it would just widen the surface with nobody using it.
+
+### 5 · Make the agent measurably better
+
+Past roughly twenty actions, tool selection quality becomes the product.
+
+- Prompt versioning that does not require a restart
+- An eval harness: fixtures, scoring, and regression gates in CI, so a prompt
+  change that degrades tool choice fails the build instead of shipping
+- Progressive disclosure for large catalogs — `SKILL.md`-style documents
+  describing when to use a group of actions, injected only when relevant, so a
+  hundred actions do not bloat every prompt. Execution still goes through the
+  catalog schema
+- Diagnostics for why a given action was or was not chosen
+
+### 6 · Widen the surface
+
+- **A headless UI package.** Split `agent-ui` into a library (chat runtime,
+  adapter, artifact registry, components) plus a thin app shell, so it can be
+  embedded in an app that is not this Next.js one — and so downstream products
+  stop having to fork the UI to change it
+- A Node backend SDK alongside `backend-py`
+- A renderer plugin API, and more builtin artifact renderers
+- A documentation site
+
+## Not on the roadmap
+
+Saying no is part of a roadmap. CogriaAgent is deliberately not:
+
+- **A general LLM orchestration library.** LangChain and LangGraph do that well
+  and this is built on them.
+- **A RAG framework.** Attachments inject documents into a turn; retrieval over a
+  corpus belongs in an action you write.
+- **Multi-tenant.** No tenant dimension anywhere, by design. Run one configured
+  instance per tenant.
+- **A model abstraction layer.** Any OpenAI-compatible endpoint works; anything
+  more is the gateway's job.
 
 ## Known gaps
 

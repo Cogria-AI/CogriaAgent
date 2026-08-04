@@ -238,9 +238,29 @@ export AGENT_VISION_MODEL=gpt-4o-mini                    # 传图片必需
 
 当前 commit 实测：149 个 Python 测试通过（3 个在缺可选依赖时跳过），`next build`
 干净通过，两个样例都跑通了真实模型的 read → propose → confirm 全流程且写入真的落库。
-路线图见 [`docs/roadmap.md`](./docs/roadmap.md)。
 
 > **Pre-1.0**，接口可能在版本间变动。HTTP 契约是最稳定的一层，建议以它为准来对接。
+
+### 后续方向
+
+按「谁解锁谁」排序，不按日期：
+
+1. **先能装上** —— 发布到 PyPI 和 npm，配语义化版本。现在唯一的用法是 clone 源码，
+   这既压死了采用率，也把想用的人推向硬分叉。
+2. **拿到生产信任** —— 成本核算与预算、贯穿三层的 OpenTelemetry 链路追踪、
+   浏览器级测试、把契约一致性套件接进 CI。
+3. **跨出单进程** —— 把进行中的 run 状态移出进程内存，让恢复能力在多 worker
+   和重启后依然成立。
+4. **对接 [MCP](https://modelcontextprotocol.io)** —— 既能把 MCP server 当动作消费，
+   也能把自己的 catalog 暴露成 MCP server，并在其上叠加 propose/confirm。
+   MCP 本身没有人工确认原语，而这道闸门正是本框架的价值所在。
+5. **让工具选择可度量地变好** —— 带回归门禁的 eval 套件、prompt 版本化、
+   大型 catalog 的渐进式披露。
+6. **拓宽适用面** —— 可脱离本 Next.js 应用嵌入的 headless UI 包、Node 后端 SDK、
+   渲染器插件 API。
+
+完整版（含「本项目刻意**不做**什么」）见 [`docs/roadmap.md`](./docs/roadmap.md)。
+对排序有不同意见，欢迎开 issue。
 
 ---
 

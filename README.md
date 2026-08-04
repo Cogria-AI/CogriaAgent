@@ -331,10 +331,32 @@ models; the governance layer is designed and not yet implemented.
 Verified on the current commit: 149 Python tests pass (3 skip without optional
 extras), `next build` succeeds clean, and both examples complete a real-LLM
 read → propose → confirm round trip with the write landing in the database.
-Roadmap: [`docs/roadmap.md`](./docs/roadmap.md).
 
 > **Pre-1.0.** Interfaces may shift between releases. The HTTP contract is the
 > most stable surface and the one to build against.
+
+### Where this is going
+
+Ordered by what unblocks what, not by dates:
+
+1. **Be installable** — publish to PyPI and npm with semantic versioning. Today
+   the only way to use this is to clone it, which caps adoption and pushes anyone
+   who wants it into a fork.
+2. **Earn production trust** — cost accounting and budgets, OpenTelemetry tracing
+   across all three tiers, browser-level tests, contract conformance in CI.
+3. **Scale past one process** — move in-flight run state off process memory so
+   resuming survives multiple workers and restarts.
+4. **Speak [MCP](https://modelcontextprotocol.io)** — consume MCP servers as
+   actions and expose your catalog as one, with propose/confirm layered on top.
+   MCP has no human-approval primitive; that gate is what this framework adds.
+5. **Make tool selection measurably better** — an eval harness with regression
+   gates, prompt versioning, and progressive disclosure for large catalogs.
+6. **Widen the surface** — a headless UI package usable outside this Next.js app,
+   a Node backend SDK, a renderer plugin API.
+
+The full version, including what CogriaAgent deliberately will *not* become, is
+in [`docs/roadmap.md`](./docs/roadmap.md). Disagreeing with the ordering is a
+useful issue to open.
 
 ---
 
