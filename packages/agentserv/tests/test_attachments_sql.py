@@ -18,7 +18,7 @@ from cogria_agent.attachments import (  # noqa: E402
 )
 from cogria_agent.sqlbackend import SqlConversationBackend  # noqa: E402
 from cogria_agent.sqlschema import attachments as attachments_table  # noqa: E402
-from cogria_agent.sqlschema import message_attachments  # noqa: E402
+from cogria_agent.sqlschema import conversations, message_attachments  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 FIELDS = dict(
@@ -119,7 +119,13 @@ async def test_message_links_and_conversation_stamp(sql_pair):
             select(attachments_table.c.conversation_id).where(attachments_table.c.id == "att_1")
         )
     assert len(links) == 1 and links[0].attachment_id == "att_1" and links[0].ordinal == 0
-    assert stamped == cid
+    # The attachment row is stamped with the INTERNAL conversation key (the FK
+    # target), not the public id the API hands out.
+    async with backend.engine.connect() as conn:
+        internal = await conn.scalar(
+            select(conversations.c.id).where(conversations.c.public_id == cid)
+        )
+    assert stamped == internal
 
     # The JSON copy is what replay reads — no join required.
     rows = await backend.fetch_history(cid)

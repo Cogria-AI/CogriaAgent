@@ -38,8 +38,8 @@ interface ChatAdapterOptions {
   /** Current UI locale; forwarded so the JWT — and thus the reply language —
    * follows the language the user is viewing. */
   locale: string;
-  getConversationId: () => number | null;
-  onConversation?: (id: number, isNew: boolean) => void;
+  getConversationId: () => string | null;
+  onConversation?: (id: string, isNew: boolean) => void;
   onComplete?: () => void;
   onConfirmRequired?: (req: ConfirmRequest) => Promise<{ confirmed: boolean }>;
   /** Active artifact tool set (builtins + project extras). Drives panel routing. */
@@ -47,6 +47,16 @@ interface ChatAdapterOptions {
   /** Optional long-running ACTION whose result yields {data:{image_url}}; while
    * it runs (post-confirm) we paint a "generating…" placeholder. */
   longRunningImageAction?: string;
+}
+
+export interface ChatStreamAdapter extends ChatModelAdapter {
+  /** Continue an in-flight run from a re-attached SSE response (see
+   * /api/chat/resume). Same frame handling as a fresh send, including the
+   * confirm flow, so a resumed turn behaves identically. */
+  resumeFromResponse(
+    resp: Response,
+    abortSignal?: AbortSignal
+  ): AsyncGenerator<{ content: ThreadAssistantMessagePart[] }, void, unknown>;
 }
 
 interface Accumulator {
@@ -62,7 +72,7 @@ export function buildChatAdapter({
   onComplete,
   artifactTools,
   longRunningImageAction,
-}: ChatAdapterOptions): ChatModelAdapter {
+}: ChatAdapterOptions): ChatStreamAdapter {
   async function postChat(body: Record<string, unknown>, signal: AbortSignal | undefined): Promise<Response> {
     return fetch('/api/chat', {
       method: 'POST',
@@ -91,32 +101,17 @@ export function buildChatAdapter({
     return parts;
   }
 
-  return {
-    async *run({ messages, abortSignal }) {
-      const last = messages[messages.length - 1];
-      const message =
-        last?.content
-          .map((p) => ('text' in p ? (p as { text: string }).text : ''))
-          .filter(Boolean)
-          .join('\n') ?? '';
-
-      // Files were uploaded by the attachment adapter as this message was sent;
-      // the turn carries only their ids, and agentserv resolves them, checks
-      // ownership and injects the content. Anything whose upload failed keeps a
-      // placeholder id — it stays visible in the transcript but isn't sent.
-      const attachmentIds = (last?.attachments ?? []).map((a) => a.id).filter(isUploaded);
-
+  /** Drive one assistant turn from an already-issued SSE response.
+   *
+   * Shared by a fresh send and a resumed run: a re-attached stream carries the
+   * same frames in the same order, so the confirm flow and artifact routing
+   * behave identically either way. */
+  async function* turnLoop(
+    firstResp: Response,
+    abortSignal: AbortSignal | undefined
+  ): AsyncGenerator<{ content: ThreadAssistantMessagePart[] }, void, unknown> {
       const acc: Accumulator = { textBuffer: '', toolCalls: new Map() };
-
-      let resp = await postChat(
-        {
-          conversation_id: getConversationId(),
-          message,
-          ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
-        },
-        abortSignal
-      );
-
+      let resp = firstResp;
       let confirmedTurn = false;
       const imageGenCalls = new Map<string, string>(); // toolCallId -> artifact key
 
@@ -132,7 +127,7 @@ export function buildChatAdapter({
 
         for await (const frame of parseSSE(resp.body)) {
           if (frame.event === 'conversation') {
-            const d = frame.data as { conversation_id?: number; new?: boolean };
+            const d = frame.data as { conversation_id?: string; new?: boolean };
             if (d.conversation_id) onConversation?.(d.conversation_id, !!d.new);
           } else if (frame.event === 'text') {
             acc.textBuffer += (frame.data as { delta?: string }).delta ?? '';
@@ -214,6 +209,36 @@ export function buildChatAdapter({
           abortSignal
         );
       }
+  }
+
+  return {
+    async *run({ messages, abortSignal }) {
+      const last = messages[messages.length - 1];
+      const message =
+        last?.content
+          .map((p) => ('text' in p ? (p as { text: string }).text : ''))
+          .filter(Boolean)
+          .join('\n') ?? '';
+
+      // Files were uploaded by the attachment adapter as this message was sent;
+      // the turn carries only their ids, and agentserv resolves them, checks
+      // ownership and injects the content. Anything whose upload failed keeps a
+      // placeholder id — it stays visible in the transcript but isn't sent.
+      const attachmentIds = (last?.attachments ?? []).map((a) => a.id).filter(isUploaded);
+
+      const resp = await postChat(
+        {
+          conversation_id: getConversationId(),
+          message,
+          ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
+        },
+        abortSignal
+      );
+      yield* turnLoop(resp, abortSignal);
+    },
+
+    async *resumeFromResponse(resp, abortSignal) {
+      yield* turnLoop(resp, abortSignal);
     },
   };
 }

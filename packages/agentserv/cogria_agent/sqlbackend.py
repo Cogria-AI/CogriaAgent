@@ -17,17 +17,17 @@ so graph.history_to_messages / summarizer work against either unchanged.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import and_, delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from .protocols import derive_title
 from .sqlschema import attachments as attachments_table
 from .sqlschema import conversations, enable_sqlite_foreign_keys, message_attachments, metadata
 from .sqlschema import messages as messages_table
-
-_TITLE_MAX = 80
 
 
 def _now() -> datetime:
@@ -89,19 +89,31 @@ class SqlConversationBackend:
     async def dispose(self) -> None:
         await self._engine.dispose()
 
+    @staticmethod
+    async def _internal_id(conn: Any, public_id: str) -> int | None:
+        """Public UUID -> serial primary key. Every method takes the public id;
+        this is the single place the two representations meet."""
+        return await conn.scalar(
+            select(conversations.c.id).where(conversations.c.public_id == str(public_id))
+        )
+
     async def create_conversation(
         self,
         *,
         first_message: str,
         model: str | None,
+        user_id: str | None = None,
         first_content: dict[str, Any] | None = None,
-    ) -> int:
+    ) -> str:
         now = _now()
         content = first_content or {"text": first_message}
+        public_id = str(uuid.uuid4())
         async with self._write_lock, self._engine.begin() as conn:
             result = await conn.execute(
                 insert(conversations).values(
-                    title=(first_message or "").strip()[:_TITLE_MAX] or None,
+                    public_id=public_id,
+                    user_id=user_id,
+                    title=None,  # NULL means "never renamed" — derive from message 0
                     model=model,
                     summarized_count=0,
                     total_input_tokens=0,
@@ -121,18 +133,20 @@ class SqlConversationBackend:
                 )
             )
             await self._link_attachments(conn, int(msg.inserted_primary_key[0]), cid, content)
-            return cid
+            return public_id
 
     async def fetch_history(
-        self, conversation_id: int | str, *, for_llm: bool = True
+        self, conversation_id: str, *, for_llm: bool = True
     ) -> list[dict[str, Any]]:
-        cid = int(conversation_id)
         async with self._engine.connect() as conn:
             conv = (
-                await conn.execute(select(conversations).where(conversations.c.id == cid))
+                await conn.execute(
+                    select(conversations).where(conversations.c.public_id == str(conversation_id))
+                )
             ).one_or_none()
             if conv is None:
                 return []
+            cid = int(conv.id)
             stmt = select(messages_table).where(messages_table.c.conversation_id == cid)
             if for_llm and conv.summary:
                 # Everything up to summarized_count is folded into the summary head.
@@ -146,18 +160,18 @@ class SqlConversationBackend:
 
     async def append_messages(
         self,
-        conversation_id: int | str,
+        conversation_id: str,
         *,
         messages: list[dict[str, Any]],  # noqa: A002 — protocol keyword
         usage: dict[str, int] | None,
         model: str | None,
     ) -> dict[str, Any]:
-        cid = int(conversation_id)
         now = _now()
         async with self._write_lock, self._engine.begin() as conn:
-            exists = await conn.scalar(select(conversations.c.id).where(conversations.c.id == cid))
-            if exists is None:
-                raise KeyError(f"no conversation {cid}")
+            cid = await self._internal_id(conn, conversation_id)
+            if cid is None:
+                raise KeyError(f"no conversation {conversation_id}")
+            cid = int(cid)
 
             max_seq = await conn.scalar(
                 select(func.coalesce(func.max(messages_table.c.seq), -1)).where(
@@ -207,32 +221,55 @@ class SqlConversationBackend:
             )
         return {"ok": True, "message_count": int(total or 0)}
 
-    async def fetch_meta(self, conversation_id: int | str) -> dict[str, Any]:
-        cid = int(conversation_id)
+    async def fetch_meta(self, conversation_id: str) -> dict[str, Any]:
+        """Everything the ownership gate and the detail view need. Returns {}
+        when the id is unknown; `deleted_at` is reported rather than filtered so
+        the caller decides what a soft-deleted conversation means to it."""
         async with self._engine.connect() as conn:
             conv = (
-                await conn.execute(select(conversations).where(conversations.c.id == cid))
+                await conn.execute(
+                    select(conversations).where(conversations.c.public_id == str(conversation_id))
+                )
             ).one_or_none()
             if conv is None:
                 return {}
             count = await conn.scalar(
                 select(func.count())
                 .select_from(messages_table)
-                .where(messages_table.c.conversation_id == cid)
+                .where(messages_table.c.conversation_id == conv.id)
             )
+            # A NULL title means "never renamed". Derive the same fallback the
+            # listing uses, so both endpoints agree on what this conversation is
+            # called — a detail view and a sidebar row disagreeing reads as a bug.
+            title = conv.title
+            if not title:
+                first = await conn.scalar(
+                    select(messages_table.c.content).where(
+                        and_(
+                            messages_table.c.conversation_id == conv.id,
+                            messages_table.c.seq == 0,
+                        )
+                    )
+                )
+                title = derive_title((first or {}).get("text") if isinstance(first, dict) else "")
         return {
-            "id": conv.id,
-            "title": conv.title,
+            "id": conv.public_id,
+            "user_id": conv.user_id,
+            "title": title or None,
+            "deleted_at": conv.deleted_at.isoformat() if conv.deleted_at else None,
             "model": conv.model,
             "message_count": int(count or 0),
             "total_input_tokens": conv.total_input_tokens,
             "total_output_tokens": conv.total_output_tokens,
             "summarized_count": conv.summarized_count,
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
         }
 
-    async def fetch_messages_full(self, conversation_id: int | str) -> list[dict[str, Any]]:
-        cid = int(conversation_id)
+    async def fetch_messages_full(self, conversation_id: str) -> list[dict[str, Any]]:
         async with self._engine.connect() as conn:
+            cid = await self._internal_id(conn, conversation_id)
+            if cid is None:
+                return []
             rows = (
                 await conn.execute(
                     select(messages_table)
@@ -242,11 +279,79 @@ class SqlConversationBackend:
             ).all()
         return [_row_to_message(r) for r in rows]
 
-    async def save_summary(
-        self, conversation_id: int | str, *, summary: str, through_index: int
-    ) -> None:
-        cid = int(conversation_id)
+    async def list_conversations(
+        self, *, user_id: str | None, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        cc = conversations.c
+        mc = messages_table.c
+        # Message count and the opening message (seq 0, which stands in for a
+        # title) as correlated subqueries, so listing N conversations stays one
+        # round trip instead of 2N.
+        count_sq = (
+            select(func.count())
+            .select_from(messages_table)
+            .where(mc.conversation_id == cc.id)
+            .scalar_subquery()
+        )
+        first_sq = (
+            select(mc.content)
+            .where(and_(mc.conversation_id == cc.id, mc.seq == 0))
+            .limit(1)
+            .scalar_subquery()
+        )
+        owned = cc.user_id == user_id if user_id is not None else cc.user_id.is_(None)
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(
+                        cc.public_id,
+                        cc.created_at,
+                        cc.title,
+                        count_sq.label("n"),
+                        first_sq.label("first"),
+                    )
+                    # Soft-deleted conversations are gone as far as their owner
+                    # is concerned; the rows stay for support and audit.
+                    .where(and_(owned, cc.deleted_at.is_(None)))
+                    .order_by(cc.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            first = r.first if isinstance(r.first, dict) else {}
+            text = (first.get("text") or "") if isinstance(first, dict) else ""
+            out.append(
+                {
+                    "id": r.public_id,
+                    "title": r.title or derive_title(text),
+                    "message_count": int(r.n or 0),
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+            )
+        return out
+
+    async def soft_delete_conversation(self, conversation_id: str) -> bool:
         async with self._engine.begin() as conn:
+            cid = await self._internal_id(conn, conversation_id)
+            if cid is None:
+                return False
+            # Idempotent: re-deleting keeps the original timestamp.
+            await conn.execute(
+                update(conversations)
+                .where(and_(conversations.c.id == cid, conversations.c.deleted_at.is_(None)))
+                .values(deleted_at=_now())
+            )
+            return True
+
+    async def save_summary(
+        self, conversation_id: str, *, summary: str, through_index: int
+    ) -> None:
+        async with self._engine.begin() as conn:
+            cid = await self._internal_id(conn, conversation_id)
+            if cid is None:
+                return
             total = int(
                 await conn.scalar(
                     select(func.count())
@@ -265,13 +370,13 @@ class SqlConversationBackend:
                 )
             )
 
-    async def delete_conversation(self, conversation_id: int | str) -> None:
-        """Not part of the protocol, but the natural counterpart of create —
-        used by retention/cleanup. Messages cascade; attachment rows survive
+    async def delete_conversation(self, conversation_id: str) -> None:
+        """Hard delete, for retention/cleanup — not the user-facing one (that is
+        soft_delete_conversation). Messages cascade; attachment rows survive
         (their own retention decides), with conversation_id set to NULL."""
         async with self._engine.begin() as conn:
             await conn.execute(
-                delete(conversations).where(conversations.c.id == int(conversation_id))
+                delete(conversations).where(conversations.c.public_id == str(conversation_id))
             )
 
     async def _link_attachments(

@@ -42,13 +42,25 @@ export class ExchangeError extends Error {
 
 /** Resolve a usable JWT for the current session. Returns null only for
  * caller-correctable conditions (401: session expired). Other failures throw. */
-export async function getOrExchangeJwt(request: NextRequest, locale?: string): Promise<ExchangedJwt | null> {
+export async function getOrExchangeJwt(
+  request: NextRequest,
+  locale?: string
+): Promise<ExchangedJwt | null> {
   // Forward whatever cookie exists (possibly empty). We don't short-circuit on a
   // missing cookie: the exchange endpoint is the authority — a real backend 401s
   // without a session (BFF returns null -> unauthenticated), while a dev backend
   // may mint a token unconditionally for local demos.
-  const cookie = request.headers.get('cookie') || '';
+  return exchangeForCookie(request.headers.get('cookie') || '', locale);
+}
 
+/** The same exchange, taking the raw cookie header instead of a request.
+ *
+ * Server components read cookies through `next/headers` and never see a
+ * NextRequest, so a page that renders conversation history needs this form. */
+export async function exchangeForCookie(
+  cookie: string,
+  locale?: string
+): Promise<ExchangedJwt | null> {
   const key = cacheKey(hashCookie(cookie), locale);
   const redis = getRedis();
 

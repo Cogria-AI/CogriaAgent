@@ -233,10 +233,10 @@ export AGENT_VISION_MODEL=gpt-4o-mini                    # 传图片必需
 | 聊天界面、artifact 面板、i18n、BFF | ✅ 可用 |
 | 脚手架 CLI + Docker Compose | ✅ 可用 |
 | 持久化（SQLite/Postgres）+ 文件上传 | ✅ 可用 |
-| 流可恢复（切走页面后重新挂上进行中的回复） | 🚧 进行中 |
+| 流可恢复（切走页面后重新挂上进行中的回复） | ✅ 可用 |
 | 成本配额、kill switch、prompt eval/ops | 📋 已设计，未实现 |
 
-当前 commit 实测：110 个 Python 测试通过（3 个在缺可选依赖时跳过），`next build`
+当前 commit 实测：149 个 Python 测试通过（3 个在缺可选依赖时跳过），`next build`
 干净通过，两个样例都跑通了真实模型的 read → propose → confirm 全流程且写入真的落库。
 路线图见 [`docs/roadmap.md`](./docs/roadmap.md)。
 

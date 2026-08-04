@@ -10,6 +10,7 @@
  */
 import { Loader2Icon } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AssistantRuntimeProvider,
@@ -36,8 +37,11 @@ import { artifactKeyFor, isArtifactTool, resolveArtifactTools } from '@/artifact
 
 interface Props {
   locale: string;
-  conversationId: number | null;
+  conversationId: string | null;
   initialMessages?: PersistedMessage[];
+  /** A reply was still being generated for this conversation when its history
+   * was fetched — re-attach to that run so it keeps rendering live. */
+  activeRun?: boolean;
 }
 
 type ReplayArtifact = { id: string; toolName: string; args: Record<string, unknown>; status: 'ready' };
@@ -137,9 +141,15 @@ function AttachmentError({ message, onDismiss }: { message: string; onDismiss: (
   );
 }
 
-export default function ChatThread({ locale, conversationId, initialMessages }: Props) {
+export default function ChatThread({
+  locale,
+  conversationId,
+  initialMessages,
+  activeRun,
+}: Props) {
+  const router = useRouter();
   const { refreshConversations } = useConversationRefresh();
-  const convIdRef = useRef<number | null>(conversationId);
+  const convIdRef = useRef<string | null>(conversationId);
 
   const hydrateArtifacts = useArtifactStore((s) => s.hydrate);
   useEffect(() => {
@@ -151,7 +161,7 @@ export default function ChatThread({ locale, conversationId, initialMessages }: 
   const [pending, setPending] = useState<PendingConfirmation | null>(null);
 
   const onConversation = useCallback(
-    (id: number, isNew: boolean) => {
+    (id: string, isNew: boolean) => {
       convIdRef.current = id;
       if (isNew) {
         // Soft URL swap; avoid router navigation which would unmount this and
@@ -213,6 +223,44 @@ export default function ChatThread({ locale, conversationId, initialMessages }: 
     initialMessages: initialMessages ? toThreadMessages(initialMessages) : undefined,
     ...(attachments ? { adapters: { attachments } } : {}),
   });
+
+  // A reply was still being generated when this conversation was loaded:
+  // re-attach to its stream (backlog replay, then the live tail) so the
+  // in-progress answer appears where the user left it instead of the thread
+  // sitting frozen until the turn lands in the database.
+  const resumeTried = useRef(false);
+  useEffect(() => {
+    if (!activeRun || conversationId == null || resumeTried.current) return;
+    resumeTried.current = true; // also guards React's dev double-effect
+    let cancelled = false;
+    (async () => {
+      let resp: Response;
+      try {
+        resp = await fetch(
+          `/api/chat/resume?conversation_id=${encodeURIComponent(conversationId)}` +
+            `&locale=${encodeURIComponent(locale)}`,
+          { headers: { Accept: 'text/event-stream' } }
+        );
+      } catch {
+        return; // best-effort: the history is intact, only liveness is lost
+      }
+      if (cancelled) return;
+      if (!resp.ok || !resp.body) {
+        // The run finished between the history fetch and now, so the missing
+        // tail is already persisted — reload rather than stream.
+        router.refresh();
+        return;
+      }
+      const msgs = runtime.thread.getState().messages;
+      runtime.thread.resumeRun({
+        parentId: msgs.length ? msgs[msgs.length - 1].id : null,
+        stream: ({ abortSignal }) => adapter.resumeFromResponse(resp, abortSignal),
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRun, conversationId, locale, adapter, runtime, router]);
 
   // Bridge artifact-panel action buttons into the conversation as a user message.
   useEffect(() => {

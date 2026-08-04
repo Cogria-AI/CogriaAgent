@@ -24,7 +24,25 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-ConversationId = int | str
+# Public conversation ids are opaque strings (the SQL backend mints UUIDs). They
+# are what appears in URLs and on the wire; a backend's internal key is its own
+# business.
+ConversationId = str
+
+# Longest stored/derived conversation title. Shared with the front-end, which
+# truncates to the same length so a rename round-trips unchanged.
+TITLE_MAX_CHARS = 60
+
+
+def derive_title(first_message_text: str | None) -> str:
+    """A conversation's fallback title: its opening message, collapsed and
+    elided. Used when the user has never renamed it, which is most of them."""
+    collapsed = " ".join((first_message_text or "").split())
+    if not collapsed:
+        return ""
+    if len(collapsed) <= TITLE_MAX_CHARS:
+        return collapsed
+    return collapsed[:TITLE_MAX_CHARS].rstrip() + "…"
 
 
 @runtime_checkable
@@ -38,6 +56,7 @@ class ConversationBackend(Protocol):
         *,
         first_message: str,
         model: str | None,
+        user_id: str | None = None,
         first_content: dict[str, Any] | None = None,
     ) -> ConversationId:
         """Start a conversation and persist its first user message.
@@ -46,7 +65,26 @@ class ConversationBackend(Protocol):
         than text (e.g. {"text": …, "attachments": […]}); when omitted the
         backend stores {"text": first_message}. `first_message` remains the
         plain-text form — backends use it for titles/search.
+
+        `user_id` is the JWT `sub` of the owner. Store it: every user-facing
+        read is filtered by it, and without it any authenticated caller could
+        read and continue anyone else's conversation.
         """
+        ...
+
+    async def list_conversations(
+        self, *, user_id: str | None, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """That user's conversations, newest first, for a history sidebar.
+
+        Returns dicts of {id, title, message_count, created_at}. Must filter by
+        `user_id` and exclude soft-deleted rows — this is a user-facing read.
+        """
+        ...
+
+    async def soft_delete_conversation(self, conversation_id: ConversationId) -> bool:
+        """Hide a conversation from its owner's history without destroying it.
+        Idempotent: re-deleting keeps the original timestamp."""
         ...
 
     async def fetch_history(self, conversation_id: ConversationId, *, for_llm: bool = True) -> list[dict[str, Any]]: ...

@@ -29,15 +29,13 @@ automatic history summarisation, plus uploads for images, PDF, Word, Excel and
 PowerPoint with server-side extraction, a token budget, and the security
 controls listed in [Attachments](./attachments.md).
 
-## In progress
-
-**Resumable streams.** The kernel already survives a client disconnect: the
-model run is decoupled from the SSE response, so navigating away mid-reply no
-longer kills generation or persists a truncated message, and the turn is written
-before `done` is emitted. What remains is the reattach path — conversation
-history endpoints, a per-conversation registry of in-flight runs with event
-replay, and the front-end reconnect — so returning to a conversation shows a
-reply that is still being written.
+**Resumable streams.** Navigating away mid-reply no longer kills generation or
+stores a truncated message: the model run is decoupled from the SSE response and
+the turn is persisted before `done` is emitted. Coming back re-attaches — the
+kernel keeps a per-conversation registry of runs in flight with an event
+backlog, so a returning client replays what it missed and then follows the rest
+live. Conversations are owned by the JWT subject and every read, continuation
+and replay is gated on it.
 
 ## Planned
 
@@ -62,10 +60,8 @@ semantic versioning, and a documentation site.
 
 Worth knowing before you build on this:
 
-- **No conversation history API.** The kernel persists conversations but exposes
-  no endpoint to list or fetch them, and the UI has no conversation route — a
-  refresh mid-conversation loses the thread on screen (the data is safe). This is
-  the missing half of resumable streams.
+- **No rename endpoint.** Conversations carry a title column and derive one from
+  the opening message, but there is no route to change it yet.
 - **Single-process assumptions.** Some in-flight state is per-process, so the
   kernel currently expects a single worker. Multi-worker deployments need a
   shared store first.

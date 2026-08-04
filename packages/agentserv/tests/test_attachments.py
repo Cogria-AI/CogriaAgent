@@ -8,6 +8,7 @@ test_attachments_extract.py (skipped unless the `attachments` extra is present).
 
 from __future__ import annotations
 
+import json
 import time
 
 import jwt
@@ -525,7 +526,7 @@ def test_document_text_reaches_the_model_and_is_persisted(tmp_path):
     assert "untrusted" in sent[0].content.lower()
     assert factory.models == [None]  # no images -> default model
 
-    rows = _eventually_persisted(backend, conversation_id=1, expected=2)
+    rows = _eventually_persisted(backend, conversation_id=_conversation_id_from(resp), expected=2)
     user_row = rows[0]
     assert user_row["content"]["text"] == "summarise this"
     assert user_row["content"]["attachments"] == [
@@ -564,7 +565,17 @@ def test_plain_turn_is_unchanged_by_the_attachment_layer(tmp_path):
     assert factory.models == [None]
 
 
-def _eventually_persisted(backend, *, conversation_id: int, expected: int, timeout: float = 2.0):
+def _conversation_id_from(resp) -> str:
+    """Pull the id out of the `conversation` SSE frame. Ids are opaque, so a
+    test can't assume one — it has to read what the server minted."""
+    for block in resp.text.split("\n\n"):
+        if block.startswith("event: conversation"):
+            payload = block.split("data: ", 1)[1]
+            return json.loads(payload)["conversation_id"]
+    raise AssertionError("no conversation frame in the stream")
+
+
+def _eventually_persisted(backend, *, conversation_id: str, expected: int, timeout: float = 2.0):
     """The turn is flushed by a background task; give it a moment to land."""
     import asyncio
 

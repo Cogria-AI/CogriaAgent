@@ -325,10 +325,10 @@ models; the governance layer is designed and not yet implemented.
 | Chat UI, artifact panel, i18n, BFF | ✅ Working |
 | Scaffolding CLI + Docker Compose | ✅ Working |
 | Durable persistence (SQLite/Postgres) + file uploads | ✅ Working |
-| Resumable streams (reattach to a reply after navigating away) | 🚧 In progress |
+| Resumable streams (reattach to a reply after navigating away) | ✅ Working |
 | Cost quotas, kill switch, prompt eval/ops | 📋 Designed, not implemented |
 
-Verified on the current commit: 110 Python tests pass (3 skip without optional
+Verified on the current commit: 149 Python tests pass (3 skip without optional
 extras), `next build` succeeds clean, and both examples complete a real-LLM
 read → propose → confirm round trip with the write landing in the database.
 Roadmap: [`docs/roadmap.md`](./docs/roadmap.md).

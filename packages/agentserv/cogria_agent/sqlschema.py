@@ -14,6 +14,8 @@ by `attachments.owner_sub` — the JWT `sub` of whoever uploaded the file.
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -55,7 +57,26 @@ conversations = Table(
     "conversations",
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
+    # The only id that leaves this process. The serial primary key stays
+    # internal so foreign keys and ordering are untouched, while URLs and the
+    # API expose an opaque value — a sequential id in a URL both leaks how many
+    # conversations exist and invites probing for someone else's.
+    Column(
+        "public_id",
+        String(36),
+        nullable=False,
+        unique=True,
+        index=True,
+        default=lambda: str(uuid.uuid4()),
+    ),
+    # The JWT `sub` that owns this conversation. Nullable because a project may
+    # run the kernel without user identity at all; when it is set, every
+    # user-facing read filters on it.
+    Column("user_id", String(200), index=True),
     Column("title", String(200)),
+    # Soft delete: rows are never removed, every user-facing read filters here
+    # so history stays available for support and audit.
+    Column("deleted_at", DateTime(timezone=True)),
     Column("model", String(200)),
     # Running summary of messages [0:summarized_count] (see summarizer.py).
     Column("summary", Text),

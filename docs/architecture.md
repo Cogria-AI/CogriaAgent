@@ -127,6 +127,47 @@ fetch triggered by it can never race the persistence.
 history fetch made while the model is still typing already shows what the user
 asked.
 
+## Coming back to a reply in progress
+
+Surviving the disconnect is only half of it — the user also has to see the reply
+when they return. The kernel keeps a registry of runs in flight, keyed by
+conversation, each holding every frame it has emitted plus the set of attached
+subscribers. The `POST /chat` response is just one subscriber.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant K as agentserv
+    participant R as run registry
+
+    U->>K: POST /chat
+    K->>R: register run
+    K-->>U: text deltas…
+    U--xK: navigates away (subscriber cancelled)
+    Note over K,R: the run keeps going and keeps recording frames
+    U->>K: returns — GET /conversations/{id}
+    K-->>U: history + active: true
+    U->>K: GET /conversations/{id}/stream
+    K->>R: subscribe + snapshot backlog
+    K-->>U: replay of missed frames, then the live tail
+    K-->>U: done
+```
+
+Subscribing and snapshotting the backlog happen together, with no `await`
+between them. That is load-bearing rather than incidental: frames are fanned out
+synchronously, so a suspension point in the middle would let one land in both
+the snapshot and the queue and the user would see it twice.
+
+If nothing is running the replay endpoint returns 404, which is the client's cue
+that the turn finished while it was away — the tail is already in the database,
+so it refetches instead of streaming.
+
+Conversation ids are opaque UUIDs, and every conversation belongs to the JWT
+subject that created it. Reads, continuations and replays all run the same
+ownership gate, and a conversation that is missing, someone else's, or soft
+deleted returns an identical 404 so an id cannot be probed for existence.
+
 ## Propose / confirm
 
 Write actions are two-phase. The model can *propose* a mutation but cannot

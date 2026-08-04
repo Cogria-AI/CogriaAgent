@@ -52,6 +52,25 @@ logger = logging.getLogger("cogria.agentserv")
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
+def _subscribe(run: dict[str, Any]) -> tuple[asyncio.Queue | None, list[bytes]]:
+    """Attach to a run and snapshot what it has already emitted.
+
+    Both halves happen here, with no `await` between them, and that is
+    load-bearing: `emit()` appends to `events` and pushes to every queue
+    synchronously, so a suspension point between subscribing and snapshotting
+    would let a frame land in both — the client would see it twice. Returning
+    them together makes it impossible to interleave anything at the call site.
+
+    A finished run yields `(None, backlog)`: there is nothing left to follow, so
+    the caller just replays and stops.
+    """
+    if run["done"]:
+        return None, list(run["events"])
+    q: asyncio.Queue = asyncio.Queue()
+    run["subs"].add(q)
+    return q, list(run["events"])
+
+
 def build_app(
     config: AgentConfig,
     *,
@@ -143,6 +162,98 @@ def build_app(
     def whoami(claims: dict = Depends(verify_jwt)) -> dict:
         return {"sub": claims.get("sub"), "role": claims.get("role"), "locale": claims.get("locale")}
 
+    # Runs in flight, keyed by conversation id. Lets a client that navigated
+    # away re-attach (GET /conversations/{id}/stream) and replay what it missed.
+    # In-process state: it assumes a single worker. Behind several workers the
+    # POST and the resume GET can land on different processes, and the resume
+    # degrades to "no active run" — correct, just not live.
+    active_runs: dict[str, dict[str, Any]] = {}
+
+    async def owned_meta(conversation_id: str, claims: dict) -> dict:
+        """The one ownership gate every conversation route runs. Someone else's
+        conversation, a nonexistent one and a soft-deleted one all return the
+        same 404 — an id must not be probeable for existence."""
+        meta = await conversation_backend.fetch_meta(conversation_id)
+        if not meta or meta.get("user_id") != claims.get("sub") or meta.get("deleted_at"):
+            raise HTTPException(404, "conversation not found")
+        return meta
+
+    @app.get("/conversations")
+    async def list_conversations(
+        claims: dict = Depends(verify_jwt), limit: int = 50, offset: int = 0
+    ) -> dict:
+        """The caller's own history. Scoped by the `sub` claim and never by a
+        caller-supplied user id — the token is the only identity."""
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        rows = await conversation_backend.list_conversations(
+            user_id=claims.get("sub"), limit=limit, offset=offset
+        )
+        return {"conversations": rows}
+
+    @app.get("/conversations/{conversation_id}")
+    async def get_conversation(
+        conversation_id: str, claims: dict = Depends(verify_jwt)
+    ) -> dict:
+        """Full message history for replay, plus whether a reply is being
+        generated right now — the flag the client uses to decide to re-attach."""
+        meta = await owned_meta(conversation_id, claims)
+        messages = await conversation_backend.fetch_messages_full(conversation_id)
+        return {
+            "conversation": meta,
+            "messages": messages,
+            "active": conversation_id in active_runs,
+        }
+
+    @app.delete("/conversations/{conversation_id}")
+    async def delete_conversation(
+        conversation_id: str, claims: dict = Depends(verify_jwt)
+    ) -> dict:
+        """Soft delete: it leaves the owner's history but the row and its
+        messages survive for support and audit."""
+        await owned_meta(conversation_id, claims)
+        await conversation_backend.soft_delete_conversation(conversation_id)
+        return {"ok": True}
+
+    @app.get("/conversations/{conversation_id}/stream")
+    async def resume_conversation_stream(
+        conversation_id: str, claims: dict = Depends(verify_jwt)
+    ) -> StreamingResponse:
+        """Re-attach to a run in progress: replay every frame it has emitted so
+        far, then follow it live until done. 404 when nothing is running — the
+        turn finished while the client was away, so it refetches history."""
+        await owned_meta(conversation_id, claims)
+        run = active_runs.get(conversation_id)
+        if run is None:
+            raise HTTPException(404, "no active run")
+        q, backlog = _subscribe(run)
+
+        async def event_stream():
+            try:
+                # No `ready` here: the client already has its tool list, and this
+                # is a continuation of a turn rather than the start of one.
+                yield sse("conversation", {"conversation_id": conversation_id, "new": False})
+                for frame in backlog:
+                    yield frame
+                while q is not None:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    yield item
+            finally:
+                if q is not None:
+                    run["subs"].discard(q)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/chat")
     async def chat(request: Request, claims: dict = Depends(verify_jwt)) -> StreamingResponse:
         try:
@@ -156,10 +267,9 @@ def build_app(
 
         conversation_id = body.get("conversation_id")
         if conversation_id is not None:
-            try:
-                conversation_id = int(conversation_id)
-            except (TypeError, ValueError):
-                raise HTTPException(422, "conversation_id must be an integer")
+            # Public ids are opaque strings; an unknown or malformed one simply
+            # fails the ownership lookup below as a 404.
+            conversation_id = str(conversation_id).strip() or None
 
         # Propose/confirm follow-up (MVP-A): the [CONFIRMED] turn carries the
         # proposal_token; feed the LLM an augmented message so it re-supplies the
@@ -216,10 +326,16 @@ def build_app(
             conversation_id = await conversation_backend.create_conversation(
                 first_message=user_message,
                 model=llm_factory.model_name(),
+                user_id=owner_sub or None,
                 first_content=user_content,
             )
             prior: list[dict[str, Any]] = []
         else:
+            # Ownership gate on continuation, before any graph or LLM work.
+            # Without it any authenticated caller could resume someone else's
+            # conversation — feeding its history to the model (a read) and
+            # appending to it (a write).
+            await owned_meta(conversation_id, claims)
             prior = await conversation_backend.fetch_history(conversation_id, for_llm=True)
             # Persist the user's message NOW rather than at flush: if the client
             # navigates away mid-run, a history fetch must still show this turn.
@@ -323,12 +439,20 @@ def build_app(
                 except Exception:  # noqa: BLE001
                     pass
 
-        # The graph runs in its own task, decoupled from the SSE generator: a
-        # client disconnect (page navigation away) cancels only the generator,
-        # while the turn runs to completion and persists via flush_turn. Without
-        # this, leaving mid-generation killed the LLM run and stored a truncated
-        # assistant message.
-        queue: asyncio.Queue = asyncio.Queue()
+        # The graph runs in its own task, decoupled from any one SSE response: a
+        # client disconnect (navigating away) cancels only that subscriber,
+        # while the turn runs to completion and persists via flush_turn. Every
+        # frame is kept in the run's backlog so a client that comes back can
+        # replay what it missed and follow the rest live.
+        run: dict[str, Any] = {"events": [], "subs": set(), "done": False}
+        active_runs[conversation_id] = run
+
+        def emit(frame: bytes) -> None:
+            run["events"].append(frame)
+            # Snapshot the set: a subscriber whose generator is being torn down
+            # can discard itself while we iterate.
+            for sub in list(run["subs"]):
+                sub.put_nowait(frame)
 
         async def run_graph():
             try:
@@ -341,7 +465,7 @@ def build_app(
                             chunk = event["data"].get("chunk")
                             if isinstance(chunk, AIMessageChunk) and chunk.content:
                                 acc["assistant_text"] += chunk.content
-                                await queue.put(sse("text", {"delta": chunk.content}))
+                                emit(sse("text", {"delta": chunk.content}))
                         elif kind == "on_chat_model_end":
                             out = event["data"].get("output")
                             if isinstance(out, (AIMessage, AIMessageChunk)):
@@ -353,7 +477,7 @@ def build_app(
                                         "name": call["name"],
                                         "args": call.get("args", {}),
                                     }
-                                    await queue.put(sse(
+                                    emit(sse(
                                         "tool_call",
                                         {"id": call["id"], "name": call["name"], "args": call.get("args", {})},
                                     ))
@@ -374,7 +498,7 @@ def build_app(
                             )
                             proposal = extract_proposal(content)
                             if proposal is not None:
-                                await queue.put(sse(
+                                emit(sse(
                                     "confirm_required",
                                     {
                                         "proposal_token": proposal.get("proposal_token"),
@@ -385,19 +509,23 @@ def build_app(
                             elif name in artifact_names:
                                 pass  # the tool_call event already drove the panel
                             else:
-                                await queue.put(
-                                    sse("tool_result", {"name": name, "content": content})
-                                )
+                                emit(sse("tool_result", {"name": name, "content": content}))
                 except Exception as e:  # noqa: BLE001
                     logger.exception("chat stream failed: %s", e)
                     acc["stream_error"] = f"{type(e).__name__}: {e}"
-                    await queue.put(sse("error", {"message": acc["stream_error"]}))
+                    emit(sse("error", {"message": acc["stream_error"]}))
             finally:
-                # Persist BEFORE emitting done: when the client sees the turn
+                # Persist BEFORE emitting done: when a client sees the turn
                 # finish, a history fetch must already include it.
                 await flush_turn()
-                await queue.put(sse("done", {"conversation_id": conversation_id}))
-                await queue.put(None)
+                emit(sse("done", {"conversation_id": conversation_id}))
+                run["done"] = True
+                for sub in list(run["subs"]):
+                    sub.put_nowait(None)  # sentinel: stop following
+                # Only retract our own entry. A second turn on this conversation
+                # may already have replaced it, and that one is still live.
+                if active_runs.get(conversation_id) is run:
+                    del active_runs[conversation_id]
 
         graph_task = asyncio.ensure_future(run_graph())
         _BACKGROUND_TASKS.add(graph_task)
@@ -406,11 +534,21 @@ def build_app(
         async def event_stream():
             yield sse("ready", {"tools": [t.name for t in tools]})
             yield sse("conversation", {"conversation_id": conversation_id, "new": is_new})
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                yield item
+            # Subscribing here rather than before the response means the graph
+            # task may already have emitted; the backlog covers exactly that gap,
+            # including the case where the whole turn finished first.
+            q, backlog = _subscribe(run)
+            try:
+                for frame in backlog:
+                    yield frame
+                while q is not None:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    yield item
+            finally:
+                if q is not None:
+                    run["subs"].discard(q)
 
         return StreamingResponse(
             event_stream(),

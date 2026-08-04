@@ -134,7 +134,15 @@ async def _post_chat(
     return frames
 
 
-async def _wait_for_turn(backend: InMemoryConversationBackend, cid: int, count: int, timeout=2.0):
+def _only_conversation(backend: InMemoryConversationBackend) -> str:
+    """The id of the single conversation this app created. Ids are opaque, so a
+    test can no longer assume the first one is `1`."""
+    ids = list(backend._store)
+    assert len(ids) == 1, f"expected exactly one conversation, got {len(ids)}"
+    return ids[0]
+
+
+async def _wait_for_turn(backend: InMemoryConversationBackend, cid: str, count: int, timeout=2.0):
     """Poll until the conversation holds `count` messages (the background graph
     task persists after the client is gone)."""
     for _ in range(int(timeout / 0.01)):
@@ -154,7 +162,7 @@ async def test_disconnect_midstream_turn_still_persists_in_full(monkeypatch):
     # The client bailed early: it saw at most a fragment, certainly no `done`.
     assert not any(f.startswith("event: done") for f in frames)
 
-    rows = await _wait_for_turn(backend, 1, 2)
+    rows = await _wait_for_turn(backend, _only_conversation(backend), 2)
     assert [r["role"] for r in rows] == ["user", "assistant"]
     assert rows[1]["content"]["text"] == "Hello world"
     assert rows[1].get("error") is None
@@ -169,7 +177,9 @@ async def test_done_frame_arrives_only_after_persist(monkeypatch):
     async def on_frame(chunk: str):
         nonlocal persisted_at_done
         if chunk.startswith("event: done"):
-            persisted_at_done = await backend.fetch_history(1, for_llm=False)
+            persisted_at_done = await backend.fetch_history(
+                _only_conversation(backend), for_llm=False
+            )
 
     await _post_chat(app, {"message": "hi"}, on_frame=on_frame)
 
@@ -180,7 +190,7 @@ async def test_done_frame_arrives_only_after_persist(monkeypatch):
 
 async def test_continuation_user_message_visible_while_streaming(monkeypatch):
     backend = InMemoryConversationBackend()
-    cid = await backend.create_conversation(first_message="hi", model=None)
+    cid = await backend.create_conversation(first_message="hi", model=None, user_id="u1")
     app = _build(backend, monkeypatch, ["re", "ply"])
 
     seen_mid_stream: list[dict[str, Any]] | None = None
