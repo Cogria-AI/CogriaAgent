@@ -8,6 +8,10 @@ Define what your product can do as a handful of typed actions with plain-English
 descriptions. CogriaAgent supplies the LLM orchestration, the streaming chat UI,
 the tool calling, the confirm-before-write safety flow, and the auth plumbing.
 
+[![CI](https://github.com/Cogria-AI/CogriaAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/Cogria-AI/CogriaAgent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+
 [Quick start](#quick-start) · [Architecture](#architecture) · [Use cases](#use-cases) · [Docs](./docs) · [中文说明](./README.zh-CN.md)
 
 </div>
