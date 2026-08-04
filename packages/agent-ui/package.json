@@ -7,7 +7,6 @@
     "dev": "next dev --port 3003",
     "build": "next build",
     "start": "next start --port 3003",
-    "lint": "next lint",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {

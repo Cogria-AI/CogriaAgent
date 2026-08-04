@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in every pyproject, plus current stable.
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run the test suite
+        # The optional extras are passed explicitly so the SQL and attachment
+        # cases actually run instead of skipping themselves.
+        run: |
+          uv run --python ${{ matrix.python-version }} \
+            --with pytest --with pytest-asyncio \
+            --with 'sqlalchemy[asyncio]' --with aiosqlite \
+            --with filetype --with python-multipart \
+            pytest packages/agentserv/tests packages/backend-py/tests \
+                   examples/todo-agent/tests examples/menu-agent/tests -q
+
+  web:
+    name: Front-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type-check
+        run: pnpm -r type-check
+
+      - name: Build
+        run: pnpm -r build
+
+  scaffold:
+    name: Scaffold a project and test it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The CLI is the first thing a new user runs, so a broken template is a
+      # broken first impression. Generate a project against this checkout and
+      # run its own tests.
+      - name: Generate and test
+        run: |
+          node packages/create-cogria-agent/index.js /tmp/scaffold-check \
+            --name scaffold-check --framework-path "$GITHUB_WORKSPACE"
+          cd /tmp/scaffold-check/agent
+          uv run --with pytest --with pytest-asyncio pytest tests -q
