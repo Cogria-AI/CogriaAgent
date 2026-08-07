@@ -52,9 +52,7 @@ def build_graph(
     system_prompt = prompt_provider.system_prompt(locale=locale) + prompt_suffix
 
     async def chat_node(state: ChatState) -> dict[str, Any]:
-        msgs = state["messages"]
-        if not msgs or not isinstance(msgs[0], SystemMessage):
-            msgs = [SystemMessage(content=system_prompt), *msgs]
+        msgs = _with_system_prompt(state["messages"], system_prompt)
 
         accumulator: AIMessageChunk | None = None
         async for chunk in llm.astream(msgs):
@@ -102,11 +100,18 @@ def build_graph(
         # Propose/confirm gate (MVP-A): if a write action just returned a proposal
         # (dry_run), END the turn so the front-end can show the ConfirmCard rather
         # than letting the LLM narrate the proposal before the user confirms.
+        #
+        # Scan every result from THIS round, not just the last one: a round
+        # calling [write_tool, read_tool] puts the proposal in the middle, and
+        # stopping at the last ToolMessage let the graph run on — the model then
+        # saw a raw requires_confirm envelope it was told not to narrate and
+        # retried the tool. A round's results are contiguous at the tail, so
+        # stop at the first non-tool message.
         for msg in reversed(state["messages"]):
-            if isinstance(msg, ToolMessage):
-                if _is_proposal(msg.content):
-                    return END
+            if not isinstance(msg, ToolMessage):
                 break
+            if _is_proposal(msg.content):
+                return END
         return "chat"
 
     graph = StateGraph(ChatState)
@@ -116,6 +121,22 @@ def build_graph(
     graph.add_conditional_edges("chat", route_after_chat, {"tools": "tools", END: END})
     graph.add_conditional_edges("tools", route_after_tools, {"chat": "chat", END: END})
     return graph.compile()
+
+
+def _with_system_prompt(messages: list[BaseMessage], system_prompt: str) -> list[BaseMessage]:
+    """Guarantee the operating prompt leads every request to the LLM.
+
+    This used to be `if not isinstance(messages[0], SystemMessage)`, which
+    silently swapped the agent's entire rulebook for a conversation summary:
+    the backends inject the running summary as a leading role=system row, so
+    from the first fold onward messages[0] was always a SystemMessage and the
+    real prompt was never injected again — the agent lost the propose/confirm
+    discipline mid-conversation. Replayed system rows stay where they are;
+    they're context, not instructions.
+    """
+    if messages and isinstance(messages[0], SystemMessage) and messages[0].content == system_prompt:
+        return messages
+    return [SystemMessage(content=system_prompt), *messages]
 
 
 def _is_proposal(content: Any) -> bool:
