@@ -345,6 +345,16 @@ class SqlConversationBackend:
             )
             return True
 
+    async def rename_conversation(self, conversation_id: str, *, title: str | None) -> bool:
+        async with self._engine.begin() as conn:
+            cid = await self._internal_id(conn, conversation_id)
+            if cid is None:
+                return False
+            await conn.execute(
+                update(conversations).where(conversations.c.id == cid).values(title=title)
+            )
+            return True
+
     async def save_summary(
         self, conversation_id: str, *, summary: str, through_index: int
     ) -> None:

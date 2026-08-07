@@ -36,6 +36,7 @@ from .config import AgentConfig
 from .graph import build_graph, history_to_messages
 from .llm import ConfigSystemPromptProvider, DefaultLLMFactory
 from .protocols import (
+    TITLE_MAX_CHARS,
     ActionExecutor,
     AttachmentRepository,
     AttachmentStore,
@@ -204,6 +205,26 @@ def build_app(
             "messages": messages,
             "active": conversation_id in active_runs,
         }
+
+    @app.patch("/conversations/{conversation_id}")
+    async def rename_conversation(
+        conversation_id: str, request: Request, claims: dict = Depends(verify_jwt)
+    ) -> dict:
+        """Rename a conversation. An empty/blank title clears it, which puts the
+        row back on the title derived from its opening message."""
+        await owned_meta(conversation_id, claims)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "invalid json") from None
+        if not isinstance(body, dict):
+            raise HTTPException(422, "body must be a JSON object")
+        raw = body.get("title")
+        if raw is not None and not isinstance(raw, str):
+            raise HTTPException(422, "title must be a string")
+        title = " ".join((raw or "").split())[:TITLE_MAX_CHARS] or None
+        await conversation_backend.rename_conversation(conversation_id, title=title)
+        return {"ok": True, "title": title}
 
     @app.delete("/conversations/{conversation_id}")
     async def delete_conversation(

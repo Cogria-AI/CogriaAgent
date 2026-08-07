@@ -296,6 +296,7 @@ async def test_a_soft_deleted_conversation_cannot_be_resumed_or_continued(monkey
     for method, path in [
         ("GET", f"/conversations/{cid}"),
         ("GET", f"/conversations/{cid}/stream"),
+        ("PATCH", f"/conversations/{cid}"),
     ]:
         _, code = await _drive(app, _scope(method, path), None)
         assert code == 404, f"{method} {path} should be gone"
@@ -304,6 +305,42 @@ async def test_a_soft_deleted_conversation_cannot_be_resumed_or_continued(monkey
         app, _scope("POST", "/chat"), {"conversation_id": cid, "message": "again"}
     )
     assert code == 404
+
+
+async def test_rename_is_owner_only_and_shows_up_in_the_list(monkeypatch):
+    backend = InMemoryConversationBackend()
+    app = _build(backend, monkeypatch, ["a"], gate=None)
+
+    first, _ = await _drive(app, _scope("POST", "/chat"), {"message": "opening words"})
+    cid = next(p["conversation_id"] for e, p in _frames(first) if e == "conversation")
+    await asyncio.sleep(0.05)
+
+    # A stranger's rename is the same 404 as a missing conversation.
+    _, code = await _drive(
+        app, _scope("PATCH", f"/conversations/{cid}", sub="u2"), {"title": "hijack"}
+    )
+    assert code == 404
+
+    # Valid JSON that isn't an object must be a 422, not a 500.
+    _, code = await _drive(app, _scope("PATCH", f"/conversations/{cid}"), ["not", "a", "dict"])
+    assert code == 422
+
+    body, code = await _drive(
+        app, _scope("PATCH", f"/conversations/{cid}"), {"title": "  My   chat  "}
+    )
+    assert code == 200
+    assert json.loads("".join(body))["title"] == "My chat"  # whitespace collapsed
+
+    listed, _ = await _drive(app, _scope("GET", "/conversations"), None)
+    rows = json.loads("".join(listed))["conversations"]
+    assert rows[0]["title"] == "My chat"
+
+    # Blank clears the stored title; the derived one comes back.
+    _, code = await _drive(app, _scope("PATCH", f"/conversations/{cid}"), {"title": "   "})
+    assert code == 200
+    listed, _ = await _drive(app, _scope("GET", "/conversations"), None)
+    rows = json.loads("".join(listed))["conversations"]
+    assert rows[0]["title"] == "opening words"
 
 
 async def test_two_clients_watching_one_run_both_see_everything(monkeypatch):

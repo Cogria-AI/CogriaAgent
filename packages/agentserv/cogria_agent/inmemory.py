@@ -150,6 +150,13 @@ class InMemoryConversationBackend:
             conv.deleted_at = _now()
         return True
 
+    async def rename_conversation(self, conversation_id: str, *, title: str | None) -> bool:
+        conv = self._store.get(str(conversation_id))
+        if not conv:
+            return False
+        conv.title = title
+        return True
+
     async def save_summary(
         self, conversation_id: str, *, summary: str, through_index: int
     ) -> None:

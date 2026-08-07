@@ -87,6 +87,12 @@ class ConversationBackend(Protocol):
         Idempotent: re-deleting keeps the original timestamp."""
         ...
 
+    async def rename_conversation(self, conversation_id: ConversationId, *, title: str | None) -> bool:
+        """Set the user-visible title; `None` clears it back to the derived one.
+        Returns False when the conversation doesn't exist. Ownership is the
+        caller's business — the backend only knows rows."""
+        ...
+
     async def fetch_history(self, conversation_id: ConversationId, *, for_llm: bool = True) -> list[dict[str, Any]]: ...
 
     async def append_messages(

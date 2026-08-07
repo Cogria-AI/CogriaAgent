@@ -117,6 +117,29 @@ async def test_soft_delete_is_idempotent(backend):
     assert (await backend.fetch_meta(cid))["deleted_at"] == first_stamp
 
 
+async def test_rename_sets_the_title_and_clearing_restores_the_derived_one(backend):
+    cid = await _seed(backend, user_id="u1", first="original opening message")
+
+    assert await backend.rename_conversation(cid, title="My renamed chat") is True
+    rows = await backend.list_conversations(user_id="u1")
+    assert rows[0]["title"] == "My renamed chat"
+    assert (await backend.fetch_meta(cid))["title"] == "My renamed chat"
+
+    # NULL means "never renamed": clearing falls back to the derived title.
+    assert await backend.rename_conversation(cid, title=None) is True
+    rows = await backend.list_conversations(user_id="u1")
+    assert rows[0]["title"] == "original opening message"
+
+
+async def test_rename_of_an_unknown_conversation_returns_false(backend):
+    assert (
+        await backend.rename_conversation(
+            "00000000-0000-4000-8000-000000000000", title="x"
+        )
+        is False
+    )
+
+
 async def test_appending_to_an_unknown_conversation_raises(backend):
     with pytest.raises(KeyError):
         await backend.append_messages(
