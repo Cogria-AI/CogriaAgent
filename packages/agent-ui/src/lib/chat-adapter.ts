@@ -11,6 +11,7 @@
  *   event: tool_call         → { id, name, args }
  *   event: tool_result       → { name, content }
  *   event: confirm_required  → { proposal_token, summary, action_name }
+ *   event: truncated         → { finish_reason } (reply cut at the output limit)
  *   event: error             → { message }
  *   event: done              → {}
  *
@@ -182,6 +183,10 @@ export function buildChatAdapter({
           } else if (frame.event === 'turn_limit') {
             const d = frame.data as { message?: string };
             if (d.message) acc.textBuffer += `\n\n${d.message}`;
+          } else if (frame.event === 'truncated') {
+            // The provider cut the reply at its output limit: the streamed text
+            // is not a complete answer, and any tool calls in it never ran.
+            acc.textBuffer += '\n\n[reply truncated at the output limit]';
           } else if (frame.event === 'error') {
             const d = frame.data as { message?: string };
             acc.textBuffer += `\n\n[error] ${d.message ?? 'unknown'}`;

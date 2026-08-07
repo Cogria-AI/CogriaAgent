@@ -23,24 +23,38 @@ class DefaultLLMFactory:
         # streaming + stream_usage are required for token-by-token SSE and for
         # persisting input/output token counts from the final chunk. `model`
         # overrides the configured one for a single request (vision turns).
-        return ChatOpenAI(
+        kwargs: dict = dict(
             model=model or c.model,
             api_key=c.api_key,
             base_url=c.base_url,
             streaming=True,
             stream_usage=True,
-            temperature=c.temperature,
         )
+        # Omit either knob when unset: the gpt-5 family rejects temperature
+        # values != 1, and some gateways reject the rewritten
+        # max_completion_tokens outright.
+        if c.max_output_tokens is not None:
+            kwargs["max_tokens"] = c.max_output_tokens
+        if c.temperature is not None:
+            kwargs["temperature"] = c.temperature
+        # gpt-5.6 on /v1/chat/completions refuses function tools unless
+        # reasoning is explicitly off (400 otherwise). Matches the effective
+        # gpt-5.2 behaviour; revisit if we move to the Responses API.
+        if (kwargs["model"] or "").startswith("gpt-5.6"):
+            kwargs["reasoning_effort"] = "none"
+        return ChatOpenAI(**kwargs)
 
     def summary_llm(self) -> ChatOpenAI:
         c = self._c.llm
-        return ChatOpenAI(
+        kwargs: dict = dict(
             model=c.summary_model or c.model,
             api_key=c.api_key,
             base_url=c.base_url,
             streaming=False,
-            temperature=c.summary_temperature,
         )
+        if c.summary_temperature is not None:
+            kwargs["temperature"] = c.summary_temperature
+        return ChatOpenAI(**kwargs)
 
     def model_name(self) -> str:
         return self._c.llm.model

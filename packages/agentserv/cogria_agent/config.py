@@ -17,14 +17,29 @@ class LLMConfig(BaseModel):
     api_key: str = ""
     model: str = "gpt-4o-mini"
     summary_model: str | None = None  # falls back to `model`
-    temperature: float = 0.2
-    summary_temperature: float = 0.3
+    # None omits the parameter entirely — some model families (gpt-5) reject
+    # any explicit value other than their default.
+    temperature: float | None = 0.2
+    summary_temperature: float | None = 0.3
+    # Explicit output budget. Left unset, the effective limit is whatever the
+    # gateway defaults to (2048 on some), so provider config silently decides
+    # when replies get cut off. Raising it does not prevent a runaway reply —
+    # the graph's per-response tool-call guards do that — it stops a
+    # legitimately long answer from being truncated at a limit we never chose.
+    # None omits the parameter — the escape hatch for gateways that reject it
+    # (langchain-openai rewrites it to max_completion_tokens on the wire).
+    max_output_tokens: int | None = 4096
 
 
 class GraphConfig(BaseModel):
     # Hard cap on chat/tool round-trips per /chat request (cost-control).
     # Complex flows rarely exceed 4; 10 leaves headroom without runaway loops.
     max_turns: int = 10
+    # Hard cap on how many distinct calls ONE model response may execute.
+    # max_turns bounds rounds, not width: a degenerate response carrying dozens
+    # of calls runs them all before the round counter is next consulted, and a
+    # call can cost real money. Legitimate replies rarely exceed 3-4.
+    max_tool_calls_per_turn: int = 8
 
 
 class SummarizerConfig(BaseModel):

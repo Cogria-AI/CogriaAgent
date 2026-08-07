@@ -4,6 +4,12 @@ The model can call any tool (action or artifact) in one or more rounds; we cap
 iterations to max_turns so a malformed tool loop can't burn budget. The system
 prompt + reply language come from a SystemPromptProvider, and the LLM from an
 LLMFactory — no business prompt or locale set is hardcoded here.
+
+max_turns bounds the number of rounds, not the width of any one of them: a
+single degenerate response can carry dozens of calls, and those all execute
+before the round counter is next consulted. Actions can cost the user real
+money (a paid external API, credits deducted per call), so tool_node also
+dedups and caps within the response — see _select_calls.
 """
 
 from __future__ import annotations
@@ -38,13 +44,15 @@ def build_graph(
     prompt_provider: SystemPromptProvider,
     locale: str | None = None,
     max_turns: int = 10,
+    max_tool_calls: int = 8,
     prompt_suffix: str = "",
     model_override: str | None = None,
 ):
     """`prompt_suffix` appends per-request guidance (e.g. how to treat attachment
     content) without projects having to bake it into their own system prompt.
     `model_override` swaps the chat model for this request only — used to route
-    a turn carrying images to a vision-capable model."""
+    a turn carrying images to a vision-capable model. `max_tool_calls` caps how
+    many distinct calls one model response may actually execute."""
     llm = (
         llm_factory.chat_llm(model=model_override) if model_override else llm_factory.chat_llm()
     ).bind_tools(tools)
@@ -58,34 +66,69 @@ def build_graph(
         async for chunk in llm.astream(msgs):
             accumulator = chunk if accumulator is None else accumulator + chunk
 
-        final = (
-            AIMessage(
-                content=accumulator.content if accumulator else "",
-                tool_calls=getattr(accumulator, "tool_calls", []) or [],
-            )
-            if accumulator is not None
-            else AIMessage(content="")
+        turns = state.get("turns", 0) + 1
+        if accumulator is None:
+            return {"messages": [AIMessage(content="")], "turns": turns}
+
+        meta = accumulator.response_metadata or {}
+        calls = getattr(accumulator, "tool_calls", []) or []
+        if calls and meta.get("finish_reason") == "length":
+            # Generation was cut off partway through the tool_calls array, so by
+            # definition it is incomplete — the last call's arguments are
+            # half-written and the ones before it are whatever happened to be
+            # emitted, not a plan the model finished thinking through. Drop the
+            # calls; the text still stands.
+            #
+            # Deliberately unreachable against api.openai.com, which raises
+            # ("Could not finish the tool call because max_tokens was reached")
+            # instead of handing back the partial array. An OpenAI-compatible
+            # gateway in front of the model is what makes this state real: one
+            # deployment received a truncated array as if it were normal output
+            # and executed all 46 calls in it.
+            calls = []
+        final = AIMessage(
+            content=accumulator.content,
+            tool_calls=calls,
+            # Carried through so the caller can persist the provider's real
+            # finish_reason instead of inferring one from local state.
+            response_metadata=meta,
         )
-        return {"messages": [final], "turns": state.get("turns", 0) + 1}
+        return {"messages": [final], "turns": turns}
 
     async def tool_node(state: ChatState) -> dict[str, Any]:
         last = state["messages"][-1]
+        calls = list(getattr(last, "tool_calls", []) or [])
+        allowed = _select_calls(calls, max_tool_calls)
+
         results: list[ToolMessage] = []
-        for call in getattr(last, "tool_calls", []) or []:
+        executed: dict[str, str] = {}  # call key -> content of its one execution
+        for call in calls:
+            key = _call_key(call)
+            if key in executed:
+                # Same tool, same args, same response: hand back the first
+                # result verbatim. The model sees exactly what it would have
+                # seen, while the action (and its charge) happens once.
+                results.append(ToolMessage(content=executed[key], tool_call_id=call["id"]))
+                continue
+            if key not in allowed:
+                results.append(ToolMessage(content=_TOO_MANY_CALLS, tool_call_id=call["id"]))
+                continue
+
             tool = tools_by_name.get(call["name"])
             if not tool:
-                results.append(
-                    ToolMessage(
-                        content=f'{{"ok":false,"error":{{"code":"UNKNOWN_TOOL","message":"No such tool: {call["name"]}"}}}}',
-                        tool_call_id=call["id"],
-                    )
-                )
-                continue
-            try:
-                payload = await tool.ainvoke(call["args"])
-            except Exception as e:  # noqa: BLE001 — tool failures must not crash the graph
-                payload = f'{{"ok":false,"error":{{"code":"TOOL_EXCEPTION","message":"{type(e).__name__}: {e}"}}}}'
-            results.append(ToolMessage(content=str(payload), tool_call_id=call["id"]))
+                content = _error_envelope("UNKNOWN_TOOL", f"No such tool: {call['name']}")
+            else:
+                try:
+                    # Invoked with the whole tool_call (not just its args) so the
+                    # returned ToolMessage carries tool_call_id — that is what
+                    # lets the caller pair results to calls by id rather than by
+                    # arrival order, which skipped calls would throw off.
+                    payload = await tool.ainvoke({**call, "type": "tool_call"})
+                    content = payload.content if isinstance(payload, ToolMessage) else str(payload)
+                except Exception as e:  # noqa: BLE001 — tool failures must not crash the graph
+                    content = _error_envelope("TOOL_EXCEPTION", f"{type(e).__name__}: {e}")
+            executed[key] = content
+            results.append(ToolMessage(content=content, tool_call_id=call["id"]))
         return {"messages": results}
 
     def route_after_chat(state: ChatState) -> str:
@@ -137,6 +180,76 @@ def _with_system_prompt(messages: list[BaseMessage], system_prompt: str) -> list
     if messages and isinstance(messages[0], SystemMessage) and messages[0].content == system_prompt:
         return messages
     return [SystemMessage(content=system_prompt), *messages]
+
+
+def _error_envelope(code: str, message: str) -> str:
+    """A tool-result error envelope, serialised properly.
+
+    These used to be hand-assembled with an f-string, which produced invalid
+    JSON the moment the interpolated text carried a newline or a quote — a
+    pydantic ValidationError (the model got the arguments wrong) does both, so
+    the one case the model most needs to read back was the one it got garbled.
+    """
+    envelope = {"ok": False, "error": {"code": code, "message": message}}
+    return json.dumps(envelope, ensure_ascii=False)
+
+
+#: Returned in place of a call that the per-response cap refused to run. Worded
+#: so the model retries deliberately on its next turn instead of reading it as a
+#: transient failure worth repeating verbatim.
+_TOO_MANY_CALLS = _error_envelope(
+    "TOO_MANY_TOOL_CALLS",
+    "Not executed — this reply requested too many tools at once. Nothing ran for "
+    "this call. Choose only the calls you actually need and make them in your "
+    "next reply.",
+)
+
+
+def _call_key(call: dict[str, Any]) -> str:
+    """Identity of a call for dedup: same tool + same arguments."""
+    args = call.get("args")
+    return json.dumps(
+        [call.get("name"), args if isinstance(args, dict) else {}],
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _is_confirmed_write(call: dict[str, Any]) -> bool:
+    """True for the second leg of propose/confirm — the call the user already
+    said yes to, carrying the proposal_token that commits the write."""
+    args = call.get("args")
+    return isinstance(args, dict) and bool(args.get("proposal_token"))
+
+
+def _select_calls(calls: list[dict[str, Any]], limit: int) -> set[str]:
+    """The distinct calls allowed to execute from one model response.
+
+    Dedup first (collapsing repeats is free and loses nothing), then cap what is
+    left. Confirmed writes are never the ones dropped: the model re-issues the
+    write tool with its proposal_token once the user clicks confirm, and cutting
+    that call surfaces as "I confirmed but nothing saved" — worse than the
+    runaway it would be guarding against. So the cap eats into reads only, and a
+    response somehow full of confirmed writes is allowed past the limit.
+    """
+    unique: list[str] = []
+    writes: set[str] = set()
+    for call in calls:
+        key = _call_key(call)
+        if key not in unique:
+            unique.append(key)
+        if _is_confirmed_write(call):
+            writes.add(key)
+    if len(unique) <= limit:
+        return set(unique)
+
+    selected = set(writes)
+    for key in unique:
+        if len(selected) >= limit:
+            break
+        selected.add(key)
+    return selected
 
 
 def _is_proposal(content: Any) -> bool:

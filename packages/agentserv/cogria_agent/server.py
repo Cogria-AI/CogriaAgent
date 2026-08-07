@@ -388,6 +388,7 @@ def build_app(
             prompt_provider=prompt_provider,
             locale=locale,
             max_turns=config.graph.max_turns,
+            max_tool_calls=config.graph.max_tool_calls_per_turn,
             prompt_suffix=prompt_suffix,
             model_override=model_override,
         )
@@ -405,6 +406,7 @@ def build_app(
             "resolved_call_ids": set(),
             "input_tokens": 0,
             "output_tokens": 0,
+            "finish_reason": None,
             "stream_error": None,
             "flushed": False,
         }
@@ -472,6 +474,23 @@ def build_app(
                                 usage = getattr(out, "usage_metadata", None) or {}
                                 acc["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
                                 acc["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+                                # The provider's own verdict on how generation
+                                # ended. Inferring it locally hid `length`
+                                # (output truncated) behind a `tool_calls` that
+                                # looked perfectly healthy. Last round wins.
+                                finish = (getattr(out, "response_metadata", None) or {}).get(
+                                    "finish_reason"
+                                )
+                                acc["finish_reason"] = finish or None
+                                if finish == "length":
+                                    # Truncated mid-array: the graph refuses to
+                                    # run these calls, so don't announce them
+                                    # either (the panel would show cards that
+                                    # never resolve). Tell the client instead —
+                                    # the streamed text has already gone out and
+                                    # must not be read as a complete answer.
+                                    emit(sse("truncated", {"finish_reason": "length"}))
+                                    continue
                                 for call in getattr(out, "tool_calls", []) or []:
                                     acc["pending_calls"][call["id"]] = {
                                         "name": call["name"],
@@ -485,14 +504,22 @@ def build_app(
                             output = event["data"].get("output")
                             name = event.get("name") or ""
                             content = output.content if isinstance(output, ToolMessage) else str(output)
-                            # Pair by name with the first unresolved pending call —
-                            # tool_calls and on_tool_end arrive in order.
-                            tool_call_id = None
-                            for cid, c in acc["pending_calls"].items():
-                                if c["name"] == name and cid not in acc["resolved_call_ids"]:
-                                    tool_call_id = cid
-                                    acc["resolved_call_ids"].add(cid)
-                                    break
+                            # Tools are invoked with the whole tool_call, so the
+                            # ToolMessage names its own id. Pair on that: the old
+                            # by-name-in-arrival-order fallback silently mispairs
+                            # as soon as any call is deduped or capped away, and
+                            # survives only for tools returning a bare value.
+                            tool_call_id = (
+                                output.tool_call_id if isinstance(output, ToolMessage) else None
+                            )
+                            if tool_call_id:
+                                acc["resolved_call_ids"].add(tool_call_id)
+                            else:
+                                for cid, c in acc["pending_calls"].items():
+                                    if c["name"] == name and cid not in acc["resolved_call_ids"]:
+                                        tool_call_id = cid
+                                        acc["resolved_call_ids"].add(cid)
+                                        break
                             acc["tool_results"].append(
                                 {"tool_call_id": tool_call_id, "name": name, "content": content}
                             )
@@ -607,12 +634,21 @@ async def _persist_turn(
         ]
 
     stream_error = acc["stream_error"]
+    # Prefer what the provider reported; infer only when it told us nothing.
+    # The inferred value can express stop/tool_calls and nothing else, so a
+    # `length` (truncated output) turn used to be indistinguishable from a
+    # healthy tool call in the record.
+    reported = acc.get("finish_reason")
     assistant_msg: dict[str, Any] = {
         "role": "assistant",
         "content": assistant_content,
         "input_tokens": acc["input_tokens"] or None,
         "output_tokens": acc["output_tokens"] or None,
-        "finish_reason": "error" if stream_error else ("tool_calls" if pending_calls else "stop"),
+        "finish_reason": (
+            "error"
+            if stream_error
+            else (reported or ("tool_calls" if pending_calls else "stop"))
+        ),
     }
     if stream_error:
         assistant_msg["error"] = {"message": stream_error}
