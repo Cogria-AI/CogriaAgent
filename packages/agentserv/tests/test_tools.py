@@ -86,3 +86,40 @@ def test_write_tool_schema_has_proposal_token_field():
     fields = _tool(tools, "delete_thing").args_schema.model_fields
     assert "proposal_token" in fields
     assert "proposal_token" not in _tool(tools, "list_things").args_schema.model_fields
+
+
+@pytest.mark.asyncio
+async def test_stringified_object_and_array_args_are_parsed():
+    """qwen (and other OpenAI-compatible models) may serialize nested object/
+    array arguments as JSON strings; validation must undo that, not reject."""
+    catalog = {
+        "actions": [
+            {
+                "name": "log_record",
+                "description": "Log.",
+                "params_schema": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "payload": {"type": "object"},
+                        "tags": {"type": "array"},
+                    },
+                    "required": ["type"],
+                },
+                "requires_confirm": False,
+            }
+        ]
+    }
+    ex = RecordingExecutor()
+    tools = build_tools_from_catalog(catalog, executor=ex)
+    await _tool(tools, "log_record").ainvoke(
+        {"type": "coffee", "payload": '{"count": 1}', "tags": '["a", "b"]'}
+    )
+    assert ex.calls[0]["args"]["payload"] == {"count": 1}
+    assert ex.calls[0]["args"]["tags"] == ["a", "b"]
+
+    # real objects still pass through untouched; non-JSON strings still fail
+    await _tool(tools, "log_record").ainvoke({"type": "water", "payload": {"count": 2}})
+    assert ex.calls[1]["args"]["payload"] == {"count": 2}
+    with pytest.raises(Exception):
+        await _tool(tools, "log_record").ainvoke({"type": "water", "payload": "not json"})

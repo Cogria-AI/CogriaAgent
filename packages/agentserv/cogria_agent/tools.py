@@ -9,21 +9,38 @@ handled here so every action gets it uniformly.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Annotated, Any
 
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, create_model
 
 from .protocols import ActionExecutor
 
-# JSON-Schema type -> python type. Minimal mapping; expand as catalogs grow.
-_TYPE_MAP: dict[str, type] = {
+
+def _parse_json_string(value: Any) -> Any:
+    """Undo model-side stringification of structured arguments.
+
+    Some OpenAI-compatible models (observed live: qwen3.7-plus) serialize
+    nested object/array tool arguments as JSON strings — {"payload": "{\\"count\\":
+    1}"} instead of {"payload": {"count": 1}} — which strict validation rejects
+    before the action ever runs. Parse strings back; anything that isn't valid
+    JSON is returned as-is so the normal type error still fires."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+# JSON-Schema type -> python annotation. Minimal mapping; expand as catalogs grow.
+_TYPE_MAP: dict[str, Any] = {
     "string": str,
     "integer": int,
     "number": float,
     "boolean": bool,
-    "array": list,
-    "object": dict,
+    "array": Annotated[list, BeforeValidator(_parse_json_string)],
+    "object": Annotated[dict, BeforeValidator(_parse_json_string)],
 }
 
 
