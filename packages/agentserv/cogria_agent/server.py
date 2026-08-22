@@ -33,6 +33,7 @@ from .attachments import (
     hydrate_history,
 )
 from .config import AgentConfig
+from .estimate import estimate_messages, warm_encoder
 from .graph import build_graph, history_to_messages
 from .llm import ConfigSystemPromptProvider, DefaultLLMFactory
 from .protocols import (
@@ -45,6 +46,8 @@ from .protocols import (
     DocumentExtractor,
     SystemPromptProvider,
 )
+from .prune import prune_result
+from .recall import RECALL_GUIDANCE, build_recall_tool
 from .sse import extract_proposal, sse
 from .tools import build_tools_from_catalog
 
@@ -113,6 +116,13 @@ def build_app(
         )
     elif attachment_store is not None or attachment_repo is not None:
         raise ValueError("attachments need BOTH attachment_store and attachment_repo")
+
+    # Validate here rather than on the first oversized result: a budget that
+    # cannot shrink anything is a deployment mistake, and mid-turn is the worst
+    # possible moment to discover it.
+    config.prune.validated()
+    # Resolve the token estimator now, off the request path.
+    warm_encoder()
 
     if not config.auth.jwt_secret:
         logger.warning("JWT_SECRET is empty; JWT verification will reject all requests.")
@@ -200,8 +210,19 @@ def build_app(
         generated right now — the flag the client uses to decide to re-attach."""
         meta = await owned_meta(conversation_id, claims)
         messages = await conversation_backend.fetch_messages_full(conversation_id)
+        # What the NEXT request would cost, against the window it has to fit in.
+        # The stored `total_*_tokens` are lifetime billing figures and grow with
+        # every turn, so they answer a different question entirely.
+        replay = await conversation_backend.fetch_history(conversation_id, for_llm=True)
+        window = config.summarizer.context_window
+        pressure = estimate_messages(replay)
         return {
-            "conversation": meta,
+            "conversation": {
+                **meta,
+                "estimated_context_tokens": pressure,
+                "context_window": window,
+                "context_usage_ratio": round(pressure / window, 4) if window else None,
+            },
             "messages": messages,
             "active": conversation_id in active_runs,
         }
@@ -403,6 +424,21 @@ def build_app(
         catalog = await catalog_provider.get_catalog()
         tools = build_tools_from_catalog(catalog, executor=action_executor, context=req_context)
         tools = tools + build_artifact_tools(artifact_defs)
+        if config.recall.enabled:
+            # Bound to THIS conversation, so the model cannot address another one.
+            tools = tools + [
+                build_recall_tool(
+                    backend=conversation_backend,
+                    conversation_id=conversation_id,
+                    config=config.recall,
+                )
+            ]
+            prompt_suffix = prompt_suffix + RECALL_GUIDANCE
+
+        # The exact prompt the graph will send. Compaction replays it verbatim so
+        # its request is a prefix of this one and the provider's cache is reused.
+        system_prompt_text = prompt_provider.system_prompt(locale=locale) + prompt_suffix
+
         graph = build_graph(
             tools,
             llm_factory=llm_factory,
@@ -445,20 +481,31 @@ def build_app(
                     acc=acc,
                     artifact_names=artifact_names,
                     model=llm_factory.model_name(),
+                    prune_config=config.prune,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.exception("persist turn failed conv=%s: %s", conversation_id, e)
 
             if config.summarizer.enabled:
                 try:
-                    asyncio.create_task(
+                    task = asyncio.ensure_future(
                         summarizer.maybe_summarize(
                             backend=conversation_backend,
                             llm_factory=llm_factory,
                             config=config.summarizer,
                             conversation_id=conversation_id,
+                            # Handed the same prompt and tools the conversation
+                            # itself uses, so the summarization call can be a
+                            # genuine prefix of the request just sent and reuse
+                            # the provider's warm cache.
+                            system_prompt=system_prompt_text,
+                            tools=tools,
                         )
                     )
+                    # Hold a reference: a bare create_task is only weakly held by
+                    # the loop, so a compaction could be collected mid-flight.
+                    _BACKGROUND_TASKS.add(task)
+                    task.add_done_callback(_BACKGROUND_TASKS.discard)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -477,91 +524,160 @@ def build_app(
             for sub in list(run["subs"]):
                 sub.put_nowait(frame)
 
+        async def rebuild_after_compaction() -> list[Any]:
+            """Re-derive this turn's messages from the freshly compacted history.
+
+            This turn's user message is already persisted — a continuation
+            appends it before the graph starts, a new conversation stores it at
+            creation — so the refetched history already contains it and must not
+            have it appended a second time.
+            """
+            rows = await conversation_backend.fetch_history(conversation_id, for_llm=True)
+            if attachment_service is not None:
+                # A fresh budget: the original one was spent on the request that
+                # just failed.
+                rows = await hydrate_history(
+                    rows,
+                    service=attachment_service,
+                    config=config.attachments,
+                    budget=Budget(
+                        config.attachments.max_chars_total,
+                        config.attachments.max_chars_per_doc,
+                    ),
+                    vision_enabled=attachment_service.vision_enabled,
+                    owner_sub=owner_sub,
+                )
+            return history_to_messages(rows)
+
+        async def drive(messages_for_run: list[Any]) -> None:
+            """Stream one model run into `acc`. Exceptions propagate: the caller
+            decides whether a failure is recoverable."""
+            async for event in graph.astream_events(
+                {"messages": messages_for_run, "turns": 0}, version="v2"
+            ):
+                kind = event.get("event")
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"].get("chunk")
+                    if isinstance(chunk, AIMessageChunk) and chunk.content:
+                        acc["assistant_text"] += chunk.content
+                        emit(sse("text", {"delta": chunk.content}))
+                elif kind == "on_chat_model_end":
+                    out = event["data"].get("output")
+                    if isinstance(out, (AIMessage, AIMessageChunk)):
+                        usage = getattr(out, "usage_metadata", None) or {}
+                        acc["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+                        acc["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+                        # The provider's own verdict on how generation
+                        # ended. Inferring it locally hid `length`
+                        # (output truncated) behind a `tool_calls` that
+                        # looked perfectly healthy. Last round wins.
+                        finish = (getattr(out, "response_metadata", None) or {}).get(
+                            "finish_reason"
+                        )
+                        acc["finish_reason"] = finish or None
+                        if finish == "length":
+                            # Truncated mid-array: the graph refuses to
+                            # run these calls, so don't announce them
+                            # either (the panel would show cards that
+                            # never resolve). Tell the client instead —
+                            # the streamed text has already gone out and
+                            # must not be read as a complete answer.
+                            emit(sse("truncated", {"finish_reason": "length"}))
+                            continue
+                        for call in getattr(out, "tool_calls", []) or []:
+                            acc["pending_calls"][call["id"]] = {
+                                "name": call["name"],
+                                "args": call.get("args", {}),
+                            }
+                            emit(sse(
+                                "tool_call",
+                                {"id": call["id"], "name": call["name"], "args": call.get("args", {})},
+                            ))
+                elif kind == "on_tool_end":
+                    output = event["data"].get("output")
+                    name = event.get("name") or ""
+                    content = output.content if isinstance(output, ToolMessage) else str(output)
+                    # Tools are invoked with the whole tool_call, so the
+                    # ToolMessage names its own id. Pair on that: the old
+                    # by-name-in-arrival-order fallback silently mispairs
+                    # as soon as any call is deduped or capped away, and
+                    # survives only for tools returning a bare value.
+                    tool_call_id = (
+                        output.tool_call_id if isinstance(output, ToolMessage) else None
+                    )
+                    if tool_call_id:
+                        acc["resolved_call_ids"].add(tool_call_id)
+                    else:
+                        for cid, c in acc["pending_calls"].items():
+                            if c["name"] == name and cid not in acc["resolved_call_ids"]:
+                                tool_call_id = cid
+                                acc["resolved_call_ids"].add(cid)
+                                break
+                    acc["tool_results"].append(
+                        {"tool_call_id": tool_call_id, "name": name, "content": content}
+                    )
+                    proposal = extract_proposal(content)
+                    if proposal is not None:
+                        emit(sse(
+                            "confirm_required",
+                            {
+                                "proposal_token": proposal.get("proposal_token"),
+                                "summary": proposal.get("summary", ""),
+                                "action_name": name,
+                            },
+                        ))
+                    elif name in artifact_names:
+                        pass  # the tool_call event already drove the panel
+                    else:
+                        emit(sse("tool_result", {"name": name, "content": content}))
         async def run_graph():
+            # A provider that rejects the request as too long is telling us
+            # something compaction can act on. Retry only while nothing has been
+            # emitted yet — once text or a tool call has gone out to the client,
+            # re-running would duplicate it.
+            attempt = 0
+            messages_for_run = initial_messages
             try:
-                try:
-                    async for event in graph.astream_events(
-                        {"messages": initial_messages, "turns": 0}, version="v2"
-                    ):
-                        kind = event.get("event")
-                        if kind == "on_chat_model_stream":
-                            chunk = event["data"].get("chunk")
-                            if isinstance(chunk, AIMessageChunk) and chunk.content:
-                                acc["assistant_text"] += chunk.content
-                                emit(sse("text", {"delta": chunk.content}))
-                        elif kind == "on_chat_model_end":
-                            out = event["data"].get("output")
-                            if isinstance(out, (AIMessage, AIMessageChunk)):
-                                usage = getattr(out, "usage_metadata", None) or {}
-                                acc["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
-                                acc["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
-                                # The provider's own verdict on how generation
-                                # ended. Inferring it locally hid `length`
-                                # (output truncated) behind a `tool_calls` that
-                                # looked perfectly healthy. Last round wins.
-                                finish = (getattr(out, "response_metadata", None) or {}).get(
-                                    "finish_reason"
-                                )
-                                acc["finish_reason"] = finish or None
-                                if finish == "length":
-                                    # Truncated mid-array: the graph refuses to
-                                    # run these calls, so don't announce them
-                                    # either (the panel would show cards that
-                                    # never resolve). Tell the client instead —
-                                    # the streamed text has already gone out and
-                                    # must not be read as a complete answer.
-                                    emit(sse("truncated", {"finish_reason": "length"}))
-                                    continue
-                                for call in getattr(out, "tool_calls", []) or []:
-                                    acc["pending_calls"][call["id"]] = {
-                                        "name": call["name"],
-                                        "args": call.get("args", {}),
-                                    }
-                                    emit(sse(
-                                        "tool_call",
-                                        {"id": call["id"], "name": call["name"], "args": call.get("args", {})},
-                                    ))
-                        elif kind == "on_tool_end":
-                            output = event["data"].get("output")
-                            name = event.get("name") or ""
-                            content = output.content if isinstance(output, ToolMessage) else str(output)
-                            # Tools are invoked with the whole tool_call, so the
-                            # ToolMessage names its own id. Pair on that: the old
-                            # by-name-in-arrival-order fallback silently mispairs
-                            # as soon as any call is deduped or capped away, and
-                            # survives only for tools returning a bare value.
-                            tool_call_id = (
-                                output.tool_call_id if isinstance(output, ToolMessage) else None
+                while True:
+                    try:
+                        await drive(messages_for_run)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        recoverable = (
+                            attempt < config.graph.max_overflow_retries
+                            and _is_context_overflow(e)
+                            and not acc["assistant_text"]
+                            and not acc["pending_calls"]
+                        )
+                        if recoverable:
+                            attempt += 1
+                            logger.warning(
+                                "context overflow conv=%s; compacting and retrying (%d/%d)",
+                                conversation_id, attempt, config.graph.max_overflow_retries,
                             )
-                            if tool_call_id:
-                                acc["resolved_call_ids"].add(tool_call_id)
-                            else:
-                                for cid, c in acc["pending_calls"].items():
-                                    if c["name"] == name and cid not in acc["resolved_call_ids"]:
-                                        tool_call_id = cid
-                                        acc["resolved_call_ids"].add(cid)
-                                        break
-                            acc["tool_results"].append(
-                                {"tool_call_id": tool_call_id, "name": name, "content": content}
+                            emit(sse("compacting", {"reason": "context_overflow"}))
+                            compacted = await summarizer.compact(
+                                backend=conversation_backend,
+                                llm_factory=llm_factory,
+                                config=config.summarizer,
+                                conversation_id=conversation_id,
+                                system_prompt=system_prompt_text,
+                                tools=tools,
+                                force=True,
                             )
-                            proposal = extract_proposal(content)
-                            if proposal is not None:
-                                emit(sse(
-                                    "confirm_required",
-                                    {
-                                        "proposal_token": proposal.get("proposal_token"),
-                                        "summary": proposal.get("summary", ""),
-                                        "action_name": name,
-                                    },
-                                ))
-                            elif name in artifact_names:
-                                pass  # the tool_call event already drove the panel
-                            else:
-                                emit(sse("tool_result", {"name": name, "content": content}))
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("chat stream failed: %s", e)
-                    acc["stream_error"] = f"{type(e).__name__}: {e}"
-                    emit(sse("error", {"message": acc["stream_error"]}))
+                            if compacted:
+                                messages_for_run = await rebuild_after_compaction()
+                                continue
+                            # Nothing safe left to fold: the original error is
+                            # the honest thing to report.
+                            logger.warning(
+                                "context overflow conv=%s: no compactable history",
+                                conversation_id,
+                            )
+                        logger.exception("chat stream failed: %s", e)
+                        acc["stream_error"] = f"{type(e).__name__}: {e}"
+                        emit(sse("error", {"message": acc["stream_error"]}))
+                        break
             finally:
                 # Persist BEFORE emitting done: when a client sees the turn
                 # finish, a history fetch must already include it.
@@ -607,6 +723,39 @@ def build_app(
     return app
 
 
+#: Substrings that identify a provider rejecting a request for being too long.
+#: Every OpenAI-compatible gateway words this differently and none of them use a
+#: shared status code, so matching text is the only portable signal. Kept
+#: deliberately narrow: a false positive costs a pointless compaction plus a
+#: retry, so nothing generic like "token" or "limit" belongs here.
+_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "maximum context length",
+    "context window",
+    "reduce the length of the messages",
+    "prompt is too long",
+    "input length and `max_tokens` exceed",
+    "too many tokens",
+)
+
+
+def _is_context_overflow(error: BaseException) -> bool:
+    """True when a request failed because the prompt did not fit.
+
+    Walks the exception chain: the SDK error that names the reason is usually
+    wrapped by the time LangChain re-raises it.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        haystack = f"{getattr(current, 'code', '') or ''} {current}".lower()
+        if any(marker in haystack for marker in _OVERFLOW_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _contains_image(messages: list[Any]) -> bool:
     """True if any message carries a multimodal image block — the signal to
     route this request to the vision model."""
@@ -630,6 +779,7 @@ async def _persist_turn(
     acc: dict[str, Any],
     artifact_names: set[str],
     model: str | None,
+    prune_config: Any | None = None,
 ) -> None:
     """Assemble the turn's assistant/tool messages and append them. The user
     message is already persisted (create_conversation for a new conversation,
@@ -684,6 +834,24 @@ async def _persist_turn(
             result_payload = json.loads(tr["content"])
         except (TypeError, ValueError):
             pass
+        # Bound the copy that goes into history. The model already received the
+        # full result during this turn; what gets stored is what every LATER
+        # turn will resend, and that is where an oversized result actually
+        # costs money. Propose/confirm envelopes are exempt inside prune_result.
+        if prune_config is not None and prune_config.enabled:
+            pruned = prune_result(
+                result_payload,
+                threshold_chars=prune_config.threshold_chars,
+                head_chars=prune_config.head_chars,
+                tail_chars=prune_config.tail_chars,
+                keep_items=prune_config.keep_items,
+            )
+            if pruned is not None:
+                logger.info(
+                    "pruned tool result name=%s conv=%s",
+                    tr.get("name"), conversation_id,
+                )
+                result_payload = pruned
         messages.append(
             {
                 "role": "tool",

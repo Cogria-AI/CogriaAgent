@@ -24,10 +24,19 @@ a session cookie for a cached JWT.
 backend actions, kernel wiring, Docker Compose, front-end configuration — from
 one command.
 
-**Persistence and attachments.** SQLite/Postgres conversation storage with
-automatic history summarisation, plus uploads for images, PDF, Word, Excel and
-PowerPoint with server-side extraction, a token budget, and the security
-controls listed in [Attachments](./attachments.md).
+**Persistence and attachments.** SQLite/Postgres conversation storage, plus
+uploads for images, PDF, Word, Excel and PowerPoint with server-side extraction,
+a token budget, and the security controls listed in
+[Attachments](./attachments.md).
+
+**Context management.** Three layers, cheapest first, all configurable in
+[Configuration](./configuration.md): oversized tool results are trimmed as they
+enter history (no model call); older messages are folded into an incremental
+checkpoint once the *next* request would fill too much of the context window;
+and a request the provider rejects as too long triggers a forced compaction and
+one retry rather than surfacing a raw provider error. Compaction never deletes —
+an optional `history_search` tool reads exact values back out of folded
+messages.
 
 **Resumable streams.** Navigating away mid-reply no longer kills generation or
 stores a truncated message: the model run is decoupled from the SSE response and
@@ -66,8 +75,9 @@ The questions an operations team asks before anything reaches real users.
 
 - **Cost governance.** Per-turn token accounting written back to storage, budgets
   enforced before a request runs, a quota endpoint contract, a kill switch, and a
-  usage banner in the UI. Today `graph.max_turns` is the only guard against a
-  runaway loop, and it counts turns rather than money.
+  usage banner in the UI. `GET /conversations/{id}` already reports
+  `estimated_context_tokens` and `context_usage_ratio`; nothing surfaces them yet,
+  and `graph.max_turns` still counts turns rather than money.
 - **Observability.** OpenTelemetry spans stitched across BFF → kernel → your
   backend, structured logs, and a pluggable error sink. Debugging a bad answer
   currently means reading server logs by hand.
@@ -145,8 +155,16 @@ Saying no is part of a roadmap. CogriaAgent is deliberately not:
 
 Worth knowing before you build on this:
 
-- **No rename endpoint.** Conversations carry a title column and derive one from
-  the opening message, but there is no route to change it yet.
+- **Estimated tokens are estimated.** Compaction thresholds are decided from a
+  local estimate (`tiktoken` when it can load its tables, a character heuristic
+  otherwise), not from a provider's own count. It is close enough to decide when
+  to compact and is not a billing figure.
+- **`context_window` is configuration, not discovery.** The kernel does not ask
+  the provider how large the window is, so a model swapped without updating
+  `summarizer.context_window` keeps the old threshold.
+- **No migrations.** The SQL backend creates its schema through `create_all()`,
+  which is a development convenience. A production deployment owns its own
+  migrations.
 - **Single-process assumptions.** Some in-flight state is per-process, so the
   kernel currently expects a single worker. Multi-worker deployments need a
   shared store first.

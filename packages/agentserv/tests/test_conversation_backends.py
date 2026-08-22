@@ -104,8 +104,14 @@ async def test_summary_replaces_folded_head(backend):
     await backend.save_summary(cid, summary="SUMMARY", through_index=5)
 
     replay = await backend.fetch_history(cid, for_llm=True)
-    assert replay[0]["role"] == "system" and replay[0]["content"]["text"] == "SUMMARY"
+    # The checkpoint replays as a USER message: the operating prompt is the only
+    # system-role instruction the model should receive, and a summary sitting in
+    # that role reads as one.
+    assert replay[0]["role"] == "user" and replay[0]["content"]["text"] == "SUMMARY"
     assert [r["content"]["text"] for r in replay[1:]] == ["m5", "m6", "m7"]
+    # fetch_meta exposes the running checkpoint so the next compaction can merge
+    # into it rather than produce a second, overlapping one.
+    assert (await backend.fetch_meta(cid))["summary"] == "SUMMARY"
 
     # for_llm=False is the raw record — no summary head, nothing dropped.
     full = await backend.fetch_history(cid, for_llm=False)

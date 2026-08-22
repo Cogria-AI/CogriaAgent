@@ -238,7 +238,7 @@ Open <http://localhost:3003/en> and try *"add a todo: buy milk"* → confirm car
 | | Streaming chat UI, tool-call visualisation, i18n, artifact panel |
 | | Propose/confirm with one-shot params-bound tokens + automatic audit trail |
 | | Tools synthesised from your catalog and validated against your schema |
-| | Conversation persistence + automatic history summarisation |
+| | Conversation persistence + context management: tool-result trimming, incremental checkpoints, overflow recovery |
 | | Optional file uploads: images, PDF, Word, Excel, PowerPoint |
 | | JWT verification, Redis-cached exchange, private-by-default kernel |
 

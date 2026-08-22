@@ -40,19 +40,86 @@ Any OpenAI-compatible gateway works. The model must support tool calling.
 | Field | Default | Notes |
 |---|---|---|
 | `max_turns` | `10` | Hard cap on model/tool round-trips per request. Real flows rarely exceed 4; this is the runaway-loop guard |
+| `max_tool_calls_per_turn` | `8` | Hard cap on distinct calls executed from ONE model response |
+| `max_overflow_retries` | `1` | Retries after the provider rejects a request as too long. Each costs a forced compaction plus a fresh request |
 
 ### `summarizer`
 
-Long conversations are folded into a running summary so the context window and
-cost stay bounded.
+Once a conversation would fill too much of the context window, its older
+messages are folded into a checkpoint and replaced by it.
+
+**Set `context_window` to match your model.** Everything else is expressed as a
+share of it, and the default is deliberately small: guessing high is the
+dangerous direction, because the threshold then sits above the real window,
+compaction never fires, and the conversation runs until the provider rejects it.
+
+| Field | Env | Default | Notes |
+|---|---|---|---|
+| `enabled` | — | `true` | |
+| `context_window` | `AGENT_CONTEXT_WINDOW` | `32000` | The model's context window |
+| `threshold_ratio` | — | `0.7` | Compact once the next request is estimated to reach this share of the window |
+| `retain_ratio` | — | `0.2` | Share of the window kept verbatim as the recent tail |
+| `keep_recent` | — | `4` | Floor on the verbatim tail, in messages |
+| `max_summary_input_ratio` | — | `0.6` | Cap on what one summarization call may read |
+| `reuse_conversation_prefix` | — | `true` | Replay the conversation's own prompt and tools so the call reuses the provider's prompt cache |
+| `prompt` | — | structured, domain-neutral | Override to preserve domain specifics (*"keep product names, prices"*) |
+| `token_threshold` | — | unset | Deprecated. Retained so an older config still loads; ignored |
+| `message_threshold` | — | `200` | A fuse against pathological message counts, not a trigger |
+
+What gets measured is the size of the messages the *next* request will replay.
+Lifetime token usage answers a different question: every turn resends the whole
+history, so cumulative usage grows quadratically whether or not the conversation
+is anywhere near full.
+
+Checkpoints are incremental — each one merges the previous checkpoint with the
+span added since — and they replay as a **user** message, because the operating
+prompt should be the only system-role instruction the model receives.
+
+Compaction never deletes anything. `summarized_count` is a cursor; every message
+stays in the backend, which is what makes [`recall`](#recall) possible.
+
+Pointing `llm.summary_model` at a different model or provider is supported, but
+it forfeits the prompt-cache reuse that `reuse_conversation_prefix` buys.
+
+### `prune`
+
+Bounds on a single tool result as it enters history. A result is written once
+and resent on every later turn, so an oversized one is charged repeatedly;
+trimming it costs no model call.
 
 | Field | Default | Notes |
 |---|---|---|
 | `enabled` | `true` | |
-| `token_threshold` | `16000` | Summarise once history exceeds this |
-| `message_threshold` | `50` | …or this many messages |
-| `keep_recent` | `20` | Messages kept verbatim after the summary |
-| `prompt` | domain-neutral | Override to preserve domain specifics (*"keep product names, prices"*) |
+| `threshold_chars` | `8192` | Prune a result whose serialized form exceeds this |
+| `head_chars` | `4096` | Retained from the start when a result is cut as text |
+| `tail_chars` | `1024` | Retained from the end |
+| `keep_items` | `20` | Rows retained when the oversized part is a list — the common case |
+
+Only the stored copy is trimmed: the model receives the full result during the
+turn that requested it. Propose/confirm envelopes are **never** pruned at any
+size, because the `proposal_token` has to come back verbatim. Structured
+results stay valid JSON — the envelope's own keys are preserved and the
+shortened list is marked with `_truncated`.
+
+`head_chars + tail_chars` must be less than `threshold_chars`; `build_app()`
+rejects a configuration that could not shrink anything.
+
+### `recall`
+
+Mounts a `history_search` tool so the model can read back exact values from
+messages that a checkpoint only summarises. Off by default — a mounted tool adds
+its schema to every request.
+
+| Field | Env | Default | Notes |
+|---|---|---|---|
+| `enabled` | `AGENT_RECALL` | `false` | Set the variable to `1`/`true` to switch it on |
+| `max_results` | — | `5` | Hits returned per search |
+| `snippet_chars` | — | `400` | Context returned per hit |
+
+Matching is literal and case-insensitive over the conversation's own rows — no
+embeddings, no index, no second store to keep in sync. The conversation id is
+bound when the tool is built and is never taken from the model, so reading
+another conversation is unreachable rather than merely unauthorized.
 
 ### `auth`
 
@@ -102,6 +169,8 @@ Read by the wiring helpers rather than `AgentConfig` itself:
 |---|---|
 | `AGENT_DB_URL` | Durable history. Unset → in-memory, lost on restart. `sqlite+aiosqlite:///./var/agent.db` or `postgresql+asyncpg://…` |
 | `AGENT_ATTACHMENTS_DIR` | Enables uploads, stores blobs at this path |
+| `AGENT_CONTEXT_WINDOW` | The model's context window, used for compaction thresholds. Default `32000` |
+| `AGENT_RECALL` | `1`/`true` mounts the `history_search` tool |
 
 Install the matching extras: `uv add "cogria-agentserv[sql,attachments]"`.
 

@@ -66,7 +66,11 @@ class InMemoryConversationBackend:
         if not conv:
             return []
         if for_llm and conv.summary:
-            head = [{"role": "system", "content": {"text": conv.summary}}]
+            # A user message, not a system one: the operating prompt is the only
+            # system-role instruction the model should get, and a checkpoint in
+            # that role reads as one. summarizer.frame_summary() supplies the
+            # framing that marks it as background.
+            head = [{"role": "user", "content": {"text": conv.summary}}]
             return head + conv.messages[conv.summarized_count :]
         return list(conv.messages)
 
@@ -110,6 +114,9 @@ class InMemoryConversationBackend:
             "total_input_tokens": conv.input_tokens,
             "total_output_tokens": conv.output_tokens,
             "summarized_count": conv.summarized_count,
+            # The running checkpoint, so a later compaction can merge into it
+            # instead of producing a second, overlapping one.
+            "summary": conv.summary,
             "created_at": conv.created_at.isoformat() if conv.created_at else None,
         }
 

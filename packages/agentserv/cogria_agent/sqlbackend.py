@@ -155,7 +155,11 @@ class SqlConversationBackend:
 
         out = [_row_to_message(r) for r in rows]
         if for_llm and conv.summary:
-            return [{"role": "system", "content": {"text": conv.summary}}, *out]
+            # A user message, not a system one: the operating prompt is the only
+            # system-role instruction the model should get, and a checkpoint in
+            # that role reads as one. summarizer.frame_summary() supplies the
+            # framing that marks it as background.
+            return [{"role": "user", "content": {"text": conv.summary}}, *out]
         return out
 
     async def append_messages(
@@ -262,6 +266,9 @@ class SqlConversationBackend:
             "total_input_tokens": conv.total_input_tokens,
             "total_output_tokens": conv.total_output_tokens,
             "summarized_count": conv.summarized_count,
+            # The running checkpoint, so a later compaction can merge into it
+            # instead of producing a second, overlapping one.
+            "summary": conv.summary,
             "created_at": conv.created_at.isoformat() if conv.created_at else None,
         }
 

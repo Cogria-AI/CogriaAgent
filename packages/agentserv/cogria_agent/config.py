@@ -40,20 +40,172 @@ class GraphConfig(BaseModel):
     # of calls runs them all before the round counter is next consulted, and a
     # call can cost real money. Legitimate replies rarely exceed 3-4.
     max_tool_calls_per_turn: int = 8
+    # How many times one request may be retried after the provider rejects it
+    # for exceeding its context window. Each retry costs a forced compaction
+    # plus a fresh request, so one is the useful number: if a maximally
+    # compacted history still doesn't fit, another attempt won't change that.
+    max_overflow_retries: int = 1
+
+
+#: The compaction instruction, delivered as the final user message after the
+#: replayed conversation. Structured on purpose: a one-line "summarize this"
+#: reliably loses the two things this kernel cannot afford to lose — exact
+#: identifiers, and the state of a propose/confirm exchange.
+DEFAULT_SUMMARY_PROMPT = "\n".join(
+    [
+        "Condense the conversation ABOVE into a structured checkpoint so the assistant "
+        "can continue the work with nothing essential lost.",
+        "",
+        "Output EXACTLY the sections below, in order. Use terse bullets. Write "
+        '"(none)" for an empty section — never drop a section.',
+        "",
+        "## Intent",
+        "- [what the user is trying to accomplish, including how it has shifted]",
+        "",
+        "## Facts and Identifiers",
+        "- [names, numbers, ids, dates, amounts — copied verbatim, never paraphrased]",
+        "",
+        "## Actions Taken",
+        "- [which tools ran, with the arguments and outcomes that still matter]",
+        "",
+        "## Confirmation State",
+        "- [any write action proposed but not yet confirmed, any the user confirmed "
+        "or cancelled, and the proposal_token verbatim if one is still open]",
+        "",
+        "## Open Requests",
+        "- [what the user asked for that is not done yet]",
+        "",
+        "## Current Work",
+        "- [precisely what was in progress at this point]",
+        "",
+        "## Next Step",
+        '- [the single next action, or "(none)"]',
+        "",
+        "Rules:",
+        "- Preserve identifiers, numbers, file names, and error strings EXACTLY. "
+        "Everything else may be compressed.",
+        "- Record the user's corrections and explicit instructions faithfully.",
+        "- Do NOT mention this instruction or that the conversation was compacted.",
+        "- Output only the checkpoint text. Do not call any tool.",
+        "- If a previous checkpoint appears above, merge it: keep what is still "
+        "true, drop what is stale, and produce ONE consolidated checkpoint rather "
+        "than copying the old one forward.",
+    ]
+)
+
+#: Framing for the message that replaces the folded span, so the model reads the
+#: checkpoint as established background rather than as a fresh instruction.
+SUMMARY_PREAMBLE = (
+    "This is an automatically generated checkpoint condensing an earlier part of "
+    "this conversation to free up context. Treat it as established background and "
+    "continue directly from the messages that follow. Do not acknowledge or restate it."
+)
 
 
 class SummarizerConfig(BaseModel):
+    """When to compact a conversation, and how much of it to keep verbatim.
+
+    Everything is expressed against `context_window`, because the question being
+    answered is "will the next request fit". The previous absolute
+    `token_threshold` compared lifetime usage — which grows quadratically, since
+    every turn resends the whole history — against a context budget, so it fired
+    on conversations that were nowhere near full and stayed quiet on ones that
+    were. It is kept only so existing configs still load.
+    """
+
     enabled: bool = True
-    token_threshold: int = 16_000
-    message_threshold: int = 50
-    keep_recent: int = 20
-    # Generic, domain-neutral summary instruction. A project may override it to
-    # add domain hints (e.g. "keep product names, prices, categories").
-    prompt: str = (
-        "Summarize the following assistant-user conversation history into a concise "
-        "running memory (max 200 words). Preserve concrete facts the assistant may "
-        "need later: names, numbers, identifiers, decisions made, and any pending actions."
-    )
+
+    # The model's context window. Set this to match `llm.model`; the default is
+    # deliberately conservative, because guessing high is the dangerous
+    # direction — the threshold ends up above the real window, compaction never
+    # fires, and the conversation runs until the provider rejects it.
+    context_window: int = 32_000
+    # Compact once the next request is estimated to reach this share of it.
+    threshold_ratio: float = 0.7
+    # How much of the recent tail to keep verbatim, as a share of the window.
+    retain_ratio: float = 0.2
+    # Floor on the verbatim tail, in messages. `retain_ratio` does the real
+    # work; this stops a single oversized message from folding everything.
+    keep_recent: int = 4
+    # Cap on what one summarization call may read, as a share of the window.
+    # Without it a long conversation eventually hands the summary model more
+    # than it can take, and the failure is silent: compaction stops working
+    # exactly when it is needed most.
+    max_summary_input_ratio: float = 0.6
+    # Replay the conversation's own system prompt, tools and messages for the
+    # summarization call, so it is a genuine prefix of the last request and the
+    # provider's prompt cache is reused. Turn off to send a flat transcript
+    # instead (correct, just billed at full price).
+    reuse_conversation_prefix: bool = True
+
+    # Retained so a config written against the old shape still loads. Unset by
+    # default and ignored; `context_window` × `threshold_ratio` decides.
+    token_threshold: int | None = None
+    # A pure fuse against pathological message counts, not a trigger.
+    message_threshold: int = 200
+
+    # Domain-neutral by default. A project may override it to add domain hints
+    # (e.g. "keep product names, prices, categories").
+    prompt: str = DEFAULT_SUMMARY_PROMPT
+
+    @property
+    def threshold_tokens(self) -> int:
+        return int(self.context_window * self.threshold_ratio)
+
+    @property
+    def retain_tokens(self) -> int:
+        return int(self.context_window * self.retain_ratio)
+
+    @property
+    def max_summary_input_tokens(self) -> int:
+        return int(self.context_window * self.max_summary_input_ratio)
+
+
+class PruneConfig(BaseModel):
+    """Bounds on a single tool result as it enters history.
+
+    A result is written once and resent on every later turn, so an oversized one
+    is charged repeatedly. Trimming it costs no model call. Propose/confirm
+    envelopes are exempt regardless of size — see prune.py.
+    """
+
+    enabled: bool = True
+    # Prune a result whose serialized form exceeds this many characters.
+    threshold_chars: int = 8_192
+    # Retained from each end when a result has to be cut as text.
+    head_chars: int = 4_096
+    tail_chars: int = 1_024
+    # Rows retained when the oversized part is a list — the common case.
+    keep_items: int = 20
+
+    def validated(self) -> PruneConfig:
+        """Reject a configuration that could not shrink anything."""
+        if self.head_chars + self.tail_chars >= self.threshold_chars:
+            raise ValueError(
+                f"PruneConfig: head_chars + tail_chars ({self.head_chars} + {self.tail_chars}) "
+                f"must be less than threshold_chars ({self.threshold_chars}); "
+                "otherwise a pruned result would not be smaller than the one that triggered it"
+            )
+        return self
+
+
+class RecallConfig(BaseModel):
+    """The `history_search` tool: letting the model read back what was folded.
+
+    Off by default, per the kernel's rule that an optional capability costs
+    nothing until asked for. Switching it on adds one tool schema to every
+    request (and so invalidates a warm prompt prefix once, at deploy time).
+
+    Compaction folds old messages out of the replay set but does NOT delete
+    them — `summarized_count` is a cursor, the rows stay in the backend. This
+    tool is the path back to them, scoped to the current conversation.
+    """
+
+    enabled: bool = False
+    # Maximum hits returned to the model in one search.
+    max_results: int = 5
+    # Characters of surrounding context returned per hit.
+    snippet_chars: int = 400
 
 
 class AttachmentsConfig(BaseModel):
@@ -121,6 +273,8 @@ class AgentConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     graph: GraphConfig = Field(default_factory=GraphConfig)
     summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
+    prune: PruneConfig = Field(default_factory=PruneConfig)
+    recall: RecallConfig = Field(default_factory=RecallConfig)
     attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     locales: LocaleConfig = Field(default_factory=LocaleConfig)
@@ -150,6 +304,14 @@ class AgentConfig(BaseModel):
                 api_key=os.environ.get("OPENAI_API_KEY", ""),
                 model=os.environ.get("AGENT_MODEL", "gpt-4o-mini"),
                 summary_model=os.environ.get("AGENT_SUMMARY_MODEL") or None,
+            ),
+            summarizer=SummarizerConfig(
+                # Sized to the model in use; the conservative default only fits
+                # the smallest windows. See SummarizerConfig.context_window.
+                context_window=int(os.environ.get("AGENT_CONTEXT_WINDOW") or 32_000),
+            ),
+            recall=RecallConfig(
+                enabled=(os.environ.get("AGENT_RECALL", "").lower() in {"1", "true", "yes"}),
             ),
             auth=AuthConfig(
                 jwt_secret=os.environ.get("JWT_SECRET", ""),

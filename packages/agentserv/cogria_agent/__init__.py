@@ -25,6 +25,8 @@ from .config import (
     GraphConfig,
     LLMConfig,
     LocaleConfig,
+    PruneConfig,
+    RecallConfig,
     SummarizerConfig,
 )
 from .http_executor import HttpActionExecutor
@@ -69,6 +71,8 @@ __all__ = [
     "LLMConfig",
     "GraphConfig",
     "SummarizerConfig",
+    "PruneConfig",
+    "RecallConfig",
     "AuthConfig",
     "LocaleConfig",
     "InMemoryConversationBackend",
