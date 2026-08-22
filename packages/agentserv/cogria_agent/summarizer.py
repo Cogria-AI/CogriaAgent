@@ -40,7 +40,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .config import SUMMARY_PREAMBLE, SummarizerConfig
+from .config import SUMMARY_PREAMBLE, AttachmentsConfig, SummarizerConfig
 from .estimate import estimate_message, estimate_messages, estimate_text
 from .graph import history_to_messages
 from .protocols import ConversationBackend
@@ -264,6 +264,7 @@ async def compact(
     conversation_id: Any,
     system_prompt: str | None = None,
     tools: list[Any] | None = None,
+    attachments: AttachmentsConfig | None = None,
     force: bool = False,
 ) -> bool:
     """Compact one conversation. Returns True if a checkpoint was written.
@@ -286,7 +287,11 @@ async def compact(
             # knows the request was too big — the provider said so — and it runs
             # inside the user's turn, so it skips the round-trip.
             replay = await backend.fetch_history(conversation_id, for_llm=True)
-            pressure = estimate_messages(replay)
+            # `attachments` prices the file content hydration will re-attach.
+            # Without it a photo reads as its filename and a full conversation
+            # looks roomy — the one error direction compaction cannot recover
+            # from on its own.
+            pressure = estimate_messages(replay, attachments=attachments)
             over_fuse = len(replay) > config.message_threshold
             if pressure < config.threshold_tokens and not over_fuse:
                 return False
@@ -391,6 +396,7 @@ async def maybe_summarize(
     conversation_id: Any,
     system_prompt: str | None = None,
     tools: list[Any] | None = None,
+    attachments: AttachmentsConfig | None = None,
 ) -> bool:
     """Compact if the next request would be over threshold. Best-effort."""
     return await compact(
@@ -400,5 +406,6 @@ async def maybe_summarize(
         conversation_id=conversation_id,
         system_prompt=system_prompt,
         tools=tools,
+        attachments=attachments,
         force=False,
     )

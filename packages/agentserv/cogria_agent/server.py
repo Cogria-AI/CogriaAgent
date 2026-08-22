@@ -124,6 +124,11 @@ def build_app(
     # Resolve the token estimator now, off the request path.
     warm_encoder()
 
+    # Attachment content is re-attached at request time, not stored on the
+    # message, so pricing a replay set needs the injection budget. `None` when
+    # uploads are off, because then nothing is ever hydrated.
+    attachment_pricing = config.attachments if attachment_service is not None else None
+
     if not config.auth.jwt_secret:
         logger.warning("JWT_SECRET is empty; JWT verification will reject all requests.")
 
@@ -215,7 +220,7 @@ def build_app(
         # every turn, so they answer a different question entirely.
         replay = await conversation_backend.fetch_history(conversation_id, for_llm=True)
         window = config.summarizer.context_window
-        pressure = estimate_messages(replay)
+        pressure = estimate_messages(replay, attachments=attachment_pricing)
         return {
             "conversation": {
                 **meta,
@@ -500,6 +505,7 @@ def build_app(
                             # the provider's warm cache.
                             system_prompt=system_prompt_text,
                             tools=tools,
+                            attachments=attachment_pricing,
                         )
                     )
                     # Hold a reference: a bare create_task is only weakly held by
@@ -663,6 +669,7 @@ def build_app(
                                 conversation_id=conversation_id,
                                 system_prompt=system_prompt_text,
                                 tools=tools,
+                                attachments=attachment_pricing,
                                 force=True,
                             )
                             if compacted:

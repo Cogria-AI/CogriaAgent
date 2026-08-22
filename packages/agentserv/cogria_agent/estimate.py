@@ -26,6 +26,8 @@ import logging
 import threading
 from typing import Any
 
+from .config import AttachmentsConfig
+
 logger = logging.getLogger("cogria.estimate")
 
 # Role framing, message delimiters, and the JSON scaffolding around a tool call:
@@ -37,6 +39,15 @@ _MESSAGE_OVERHEAD = 4
 # this sits high on purpose, because under-counting images is what lets a
 # conversation sail past the threshold without ever triggering compaction.
 _IMAGE_TOKENS = 800
+
+# What one `<attachment id=… name=… type=… note=… />` element costs beyond its
+# filename: the tag scaffolding, which every attachment replays whether or not
+# its content does.
+_ATTACHMENT_REF_TOKENS = 24
+
+# Tokens per character when a conversation offers no text to sample from —
+# the usual Latin rule of thumb. See `_observed_density`.
+_DEFAULT_DENSITY = 0.25
 
 # Non-ASCII scripts that are roughly one token per character rather than the
 # ~4 characters per token that Latin text averages. CJK ideographs, kana,
@@ -182,17 +193,125 @@ def estimate_message(row: dict[str, Any]) -> int:
             result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         )
 
-    # Attachment metadata is replayed as a short filename list, not as content.
+    # Each attachment replays at minimum as one <attachment …/> element naming
+    # it. Whether its CONTENT also replays is a whole-request decision, priced
+    # by `estimate_messages` — see `_replay_attachment_tokens`.
     for att in content.get("attachments") or []:
         if isinstance(att, dict):
-            total += estimate_text(str(att.get("name") or "")) + 2
+            total += estimate_text(str(att.get("name") or "")) + _ATTACHMENT_REF_TOKENS
 
     return total
 
 
-def estimate_messages(rows: list[dict[str, Any]]) -> int:
-    """Tokens for a whole replay set."""
-    return sum(estimate_message(row) for row in rows)
+def _replay_attachment_tokens(
+    rows: list[dict[str, Any]], attachments: AttachmentsConfig
+) -> int:
+    """What attachment CONTENT will cost when this replay set is hydrated.
+
+    Persisted rows carry only a reference to each file — `{id, name, mime,
+    size, kind}`. The bytes and the extracted text are re-attached later, by
+    `attachments.hydrate_history`, and only then does the request grow by an
+    image block or a page of document text. Pricing the stored rows alone
+    therefore misses the single most expensive thing in them: one photo costs
+    around 800 tokens and reads as 15.
+
+    That error runs in the unsafe direction — it makes a full conversation look
+    roomy, so compaction waits. This function closes it by modelling what
+    hydration will do, from the same configuration hydration itself obeys.
+
+    Two different kinds of estimate, deliberately:
+
+    - **Images are priced exactly.** `image_history_turns` decides how many of
+      the most recent image-bearing turns are re-sent as pictures; the rest
+      degrade to a one-line placeholder that `estimate_message` already counted.
+      Walking newest-first mirrors `hydrate_history` exactly.
+    - **Documents are priced by their allowance**, because knowing the real
+      length would mean reading the attachment store — an I/O round trip per
+      message, on a path that runs before every compaction check. `Budget`
+      caps each document at `max_chars_per_doc` and the whole request at
+      `max_chars_total`, spent newest-first, so the allowance is a true upper
+      bound. A deployment whose `max_chars_total` is a large share of its
+      `context_window` will therefore look fuller than it is; the fix there is
+      to lower the injection budget, which lowers the real cost too.
+    """
+    image_turns_left = attachments.image_history_turns if attachments.vision_model else 0
+    doc_chars_left = attachments.max_chars_total
+    density = _observed_density(rows)
+    total = 0
+
+    for row in reversed(rows):
+        content = row.get("content")
+        if not isinstance(content, dict):
+            continue
+        # An already-hydrated row carries its real content in `blocks`, which
+        # `estimate_message` priced. Pricing it again here would double-count.
+        if content.get("blocks"):
+            continue
+        refs = [a for a in (content.get("attachments") or []) if isinstance(a, dict)]
+        if not refs:
+            continue
+
+        images = [a for a in refs if a.get("kind") == "image"]
+        if images and image_turns_left > 0:
+            total += len(images) * _IMAGE_TOKENS
+            image_turns_left -= 1
+
+        for _doc in (a for a in refs if a.get("kind") != "image"):
+            if doc_chars_left <= 0:
+                break
+            allowance = min(attachments.max_chars_per_doc, doc_chars_left)
+            doc_chars_left -= allowance
+            total += int(allowance * density)
+
+    return total
+
+
+def _observed_density(rows: list[dict[str, Any]]) -> float:
+    """Tokens per character, measured on this conversation's own visible text.
+
+    A character budget says nothing about token cost on its own: 40 000
+    characters is roughly 10 000 tokens of English and roughly 36 000 of
+    Chinese. Picking either constant is wrong for half the deployments, and
+    tokenizing a synthetic filler string is worse than both — a run of one
+    repeated character compresses to almost nothing and would model a document
+    at a third of its real cost.
+
+    Sampling the conversation sidesteps the guess: whatever language the people
+    in it are writing, their documents are overwhelmingly in that language too.
+    """
+    chars = 0
+    tokens = 0
+    for row in rows:
+        content = row.get("content")
+        if not isinstance(content, dict):
+            continue
+        text = content.get("text")
+        if isinstance(text, str) and text:
+            chars += len(text)
+            tokens += estimate_text(text)
+        if chars >= 2_000:  # a large enough sample; stop paying to tokenize
+            break
+    if chars == 0:
+        return _DEFAULT_DENSITY
+    # Clamp: a tiny unrepresentative sample (one emoji, one URL) must not scale
+    # a 40 000-character budget into nonsense in either direction.
+    return min(1.0, max(0.2, tokens / chars))
+
+
+def estimate_messages(
+    rows: list[dict[str, Any]], *, attachments: AttachmentsConfig | None = None
+) -> int:
+    """Tokens for a whole replay set.
+
+    Pass `attachments` when the deployment has uploads switched on, so the
+    content that hydration will re-attach is priced too. Omitting it prices the
+    stored rows verbatim, which is correct for a deployment with no attachment
+    store — nothing is ever hydrated there.
+    """
+    total = sum(estimate_message(row) for row in rows)
+    if attachments is not None:
+        total += _replay_attachment_tokens(rows, attachments)
+    return total
 
 
 def reset_encoder_cache() -> None:

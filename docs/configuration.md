@@ -71,6 +71,17 @@ Lifetime token usage answers a different question: every turn resends the whole
 history, so cumulative usage grows quadratically whether or not the conversation
 is anywhere near full.
 
+When uploads are enabled, that measurement includes the file content the request
+is about to re-attach, not just the reference stored on the message — a photo
+costs around 800 tokens and reads as its filename otherwise. Images are priced
+by `attachments.image_history_turns` (only the most recent image-bearing turns
+are re-sent as pictures); document text is priced by its injection allowance,
+converted at the token density observed in the conversation's own text, because
+a character budget is not a token budget and the exchange rate is the language.
+A deployment whose `attachments.max_chars_total` is a large share of its
+`context_window` will therefore read as fuller than it is; lowering the
+injection budget lowers both the estimate and the real cost.
+
 Checkpoints are incremental — each one merges the previous checkpoint with the
 span added since — and they replay as a **user** message, because the operating
 prompt should be the only system-role instruction the model receives.

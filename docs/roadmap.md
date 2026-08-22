@@ -158,7 +158,10 @@ Worth knowing before you build on this:
 - **Estimated tokens are estimated.** Compaction thresholds are decided from a
   local estimate (`tiktoken` when it can load its tables, a character heuristic
   otherwise), not from a provider's own count. It is close enough to decide when
-  to compact and is not a billing figure.
+  to compact and is not a billing figure. Document attachments are modelled by
+  their injection allowance rather than their real extracted length, since
+  knowing the latter would mean reading the attachment store before every
+  compaction check.
 - **`context_window` is configuration, not discovery.** The kernel does not ask
   the provider how large the window is, so a model swapped without updating
   `summarizer.context_window` keeps the old threshold.
