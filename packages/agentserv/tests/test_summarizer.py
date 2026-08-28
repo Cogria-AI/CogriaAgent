@@ -396,3 +396,55 @@ async def test_retention_prices_attachments_like_pressure_does():
     # Priced, one photo turn alone already fills the budget.
     assert aware > blind
     assert aware == len(rows) - 1
+
+
+@pytest.mark.asyncio
+async def test_prefix_reuse_is_skipped_for_a_different_summary_model():
+    """Replaying the prefix pays off only against the model that warmed the
+    cache. Routed to a cheaper model it is a pure loss: a full structured
+    replay instead of a flat transcript, billed at list price."""
+
+    class _Cheap(_FakeLLMFactory):
+        def model_name(self):
+            return "big-chat-model"
+
+        def summary_llm(self):
+            llm = _FakeSummaryLLM(self.recorder)
+            llm.model_name = "cheap-summary-model"
+            return llm
+
+    backend = InMemoryConversationBackend()
+    cid = await backend.create_conversation(first_message="hi", model="m")
+    await _seed_heavy(backend, cid)
+
+    factory = _Cheap()
+    assert await maybe_summarize(
+        backend=backend,
+        llm_factory=factory,
+        config=_cfg(),
+        conversation_id=cid,
+        system_prompt="OPERATING PROMPT",
+    )
+    sent = factory.recorder["messages"]
+    # The flat form: an instruction and a transcript, not a replayed prefix.
+    assert len(sent) == 2
+    assert "OPERATING PROMPT" not in str(sent[0].content)
+
+
+@pytest.mark.asyncio
+async def test_prefix_reuse_survives_a_factory_it_cannot_introspect():
+    """An injected factory may route however it likes. Unable to tell, honour
+    what the caller configured rather than silently downgrading it."""
+    backend = InMemoryConversationBackend()
+    cid = await backend.create_conversation(first_message="hi", model="m")
+    await _seed_heavy(backend, cid)
+
+    factory = _FakeLLMFactory()  # no model_name() at all
+    assert await maybe_summarize(
+        backend=backend,
+        llm_factory=factory,
+        config=_cfg(),
+        conversation_id=cid,
+        system_prompt="OPERATING PROMPT",
+    )
+    assert factory.recorder["messages"][0].content == "OPERATING PROMPT"

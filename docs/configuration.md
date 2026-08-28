@@ -89,8 +89,18 @@ prompt should be the only system-role instruction the model receives.
 Compaction never deletes anything. `summarized_count` is a cursor; every message
 stays in the backend, which is what makes [`recall`](#recall) possible.
 
-Pointing `llm.summary_model` at a different model or provider is supported, but
-it forfeits the prompt-cache reuse that `reuse_conversation_prefix` buys.
+`reuse_conversation_prefix` is a permission, not a command: replaying the prefix
+only pays off against the model that warmed the cache, so pointing
+`llm.summary_model` at a different (usually cheaper) model automatically falls
+back to sending a flat transcript. Without that fallback the setting would be a
+pure loss there — a full structured replay instead of a compact transcript,
+billed at list price by a model with no cache for it.
+
+`context_window` is a **budget, not a hardware limit**. On a model with a very
+large window, setting it to the technical maximum means compaction never fires
+until the request is enormous — and every turn resends the whole prompt, so the
+bill arrives long before the window does. Pick what one request should be
+allowed to cost.
 
 ### `prune`
 

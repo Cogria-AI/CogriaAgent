@@ -223,6 +223,26 @@ def _cap_input(
     return rows[start:], start, True
 
 
+def _same_model(llm_factory: Any, summary_llm: Any) -> bool:
+    """Whether summarization runs on the model that warmed the prompt cache.
+
+    Read off the built client rather than from config, because an injected
+    factory may route however it likes. When either name is unavailable the
+    answer is "assume yes": that preserves the behaviour a caller asked for
+    instead of silently downgrading it on a factory this cannot introspect.
+    """
+    summary_name = getattr(summary_llm, "model_name", None) or getattr(summary_llm, "model", None)
+    chat_name = None
+    if hasattr(llm_factory, "model_name"):
+        try:
+            chat_name = llm_factory.model_name()
+        except Exception:  # noqa: BLE001 — an unusable factory must not break compaction
+            chat_name = None
+    if not summary_name or not chat_name:
+        return True
+    return str(summary_name) == str(chat_name)
+
+
 async def _summarize(
     *,
     llm_factory: Any,
@@ -241,6 +261,12 @@ async def _summarize(
     charges only for the instruction. Omitting the tool schemas would break
     that: they are serialized ahead of the messages, so a mismatch there
     invalidates the prefix from its first token.
+
+    The reuse only pays off against the model that warmed the cache. Routing
+    summarization to a different (usually cheaper) model turns it into a pure
+    loss — a full structured replay instead of a flat transcript, billed at
+    list price — so a differing model falls back to the transcript form even
+    when reuse is switched on. The flag stays a permission, not a command.
     """
     instruction = config.prompt
     if dropped_prefix:
@@ -251,7 +277,14 @@ async def _summarize(
 
     llm = llm_factory.summary_llm()
 
-    if config.reuse_conversation_prefix:
+    if config.reuse_conversation_prefix and not _same_model(llm_factory, llm):
+        logger.debug(
+            "summarization is routed to a different model; sending a flat "
+            "transcript instead of replaying the prefix, which that model "
+            "has no cache for"
+        )
+
+    if config.reuse_conversation_prefix and _same_model(llm_factory, llm):
         messages: list[Any] = []
         if system_prompt:
             messages.append(SystemMessage(content=system_prompt))
