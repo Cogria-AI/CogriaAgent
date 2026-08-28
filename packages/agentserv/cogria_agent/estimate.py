@@ -205,8 +205,14 @@ def estimate_message(row: dict[str, Any]) -> int:
 
 def _replay_attachment_tokens(
     rows: list[dict[str, Any]], attachments: AttachmentsConfig
-) -> int:
+) -> dict[int, int]:
     """What attachment CONTENT will cost when this replay set is hydrated.
+
+    Returned per row index rather than as one total, because the cost has to be
+    attributable: retention decides how much of the tail to keep by walking
+    messages backwards and adding up what each one costs, and a photo that
+    prices as its filename there would let the tail keep far more than its
+    budget allows.
 
     Persisted rows carry only a reference to each file — `{id, name, mime,
     size, kind}`. The bytes and the extracted text are re-attached later, by
@@ -237,9 +243,10 @@ def _replay_attachment_tokens(
     image_turns_left = attachments.image_history_turns if attachments.vision_model else 0
     doc_chars_left = attachments.max_chars_total
     density = _observed_density(rows)
-    total = 0
+    per_row: dict[int, int] = {}
 
-    for row in reversed(rows):
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
         content = row.get("content")
         if not isinstance(content, dict):
             continue
@@ -251,9 +258,10 @@ def _replay_attachment_tokens(
         if not refs:
             continue
 
+        cost = 0
         images = [a for a in refs if a.get("kind") == "image"]
         if images and image_turns_left > 0:
-            total += len(images) * _IMAGE_TOKENS
+            cost += len(images) * _IMAGE_TOKENS
             image_turns_left -= 1
 
         for _doc in (a for a in refs if a.get("kind") != "image"):
@@ -261,9 +269,12 @@ def _replay_attachment_tokens(
                 break
             allowance = min(attachments.max_chars_per_doc, doc_chars_left)
             doc_chars_left -= allowance
-            total += int(allowance * density)
+            cost += int(allowance * density)
 
-    return total
+        if cost:
+            per_row[index] = cost
+
+    return per_row
 
 
 def _observed_density(rows: list[dict[str, Any]]) -> float:
@@ -298,20 +309,33 @@ def _observed_density(rows: list[dict[str, Any]]) -> float:
     return min(1.0, max(0.2, tokens / chars))
 
 
+def estimate_row_costs(
+    rows: list[dict[str, Any]], *, attachments: AttachmentsConfig | None = None
+) -> list[int]:
+    """Per-row tokens for a replay set, positionally aligned with `rows`.
+
+    Attachment content is charged to the row that carries the file, so a caller
+    walking the list backwards to size a retained tail charges the same price
+    the whole-set total does. Whether a file's content replays at all is a
+    whole-set decision, which is why this cannot be computed one row at a time.
+
+    Pass `attachments` when the deployment has uploads switched on. Omitting it
+    prices the stored rows verbatim, which is correct where nothing is ever
+    hydrated — and correct for the summarization input too, since that replays
+    the stored rows rather than a hydrated request.
+    """
+    costs = [estimate_message(row) for row in rows]
+    if attachments is not None:
+        for index, extra in _replay_attachment_tokens(rows, attachments).items():
+            costs[index] += extra
+    return costs
+
+
 def estimate_messages(
     rows: list[dict[str, Any]], *, attachments: AttachmentsConfig | None = None
 ) -> int:
-    """Tokens for a whole replay set.
-
-    Pass `attachments` when the deployment has uploads switched on, so the
-    content that hydration will re-attach is priced too. Omitting it prices the
-    stored rows verbatim, which is correct for a deployment with no attachment
-    store — nothing is ever hydrated there.
-    """
-    total = sum(estimate_message(row) for row in rows)
-    if attachments is not None:
-        total += _replay_attachment_tokens(rows, attachments)
-    return total
+    """Tokens for a whole replay set."""
+    return sum(estimate_row_costs(rows, attachments=attachments))
 
 
 def reset_encoder_cache() -> None:

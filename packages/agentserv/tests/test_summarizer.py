@@ -368,3 +368,31 @@ async def test_render_keeps_attachment_names():
     )
     assert "check this" in rendered
     assert "menu.pdf" in rendered and "q3.docx" in rendered
+
+
+@pytest.mark.asyncio
+async def test_retention_prices_attachments_like_pressure_does():
+    """The tail budget and the pressure check must agree on what a photo costs.
+
+    Making pressure attachment-aware while retention stayed blind let a
+    photo-heavy tail keep several times its budget: the tail reads as its
+    filenames, compaction under-delivers, and the retry loop burns its attempts
+    on a conversation it never actually shrank.
+    """
+    from cogria_agent.config import AttachmentsConfig
+    from cogria_agent.summarizer import _select_cutoff
+
+    photo = {
+        "role": "user",
+        "content": {"text": "午饭", "attachments": [{"id": "a", "name": "l.jpg", "kind": "image"}]},
+    }
+    rows = [dict(photo) for _ in range(12)]
+    cfg = _cfg(retain_ratio=0.2, keep_recent=1)  # 200 tokens of tail
+
+    blind = _select_cutoff(rows, cfg)
+    aware = _select_cutoff(rows, cfg, AttachmentsConfig(vision_model="v"))
+
+    # Blind to the pictures, the tail looks nearly free and keeps walking back.
+    # Priced, one photo turn alone already fills the budget.
+    assert aware > blind
+    assert aware == len(rows) - 1

@@ -41,7 +41,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import SUMMARY_PREAMBLE, AttachmentsConfig, SummarizerConfig
-from .estimate import estimate_message, estimate_messages, estimate_text
+from .estimate import estimate_message, estimate_messages, estimate_row_costs, estimate_text
 from .graph import history_to_messages
 from .protocols import ConversationBackend
 
@@ -155,22 +155,33 @@ def _align_cutoff(rows: list[dict[str, Any]], cutoff: int) -> int:
     return cutoff
 
 
-def _select_cutoff(rows: list[dict[str, Any]], config: SummarizerConfig) -> int:
+def _select_cutoff(
+    rows: list[dict[str, Any]],
+    config: SummarizerConfig,
+    attachments: AttachmentsConfig | None = None,
+) -> int:
     """How many leading rows to fold, keeping a token-sized verbatim tail.
 
     Counting messages rather than tokens — the previous behaviour — measures
     the wrong thing in both directions: twenty short exchanges are nothing to
     keep, while twenty rows carrying three large tool results are most of the
     window.
+
+    Retention is priced with the same `attachments` the pressure check uses.
+    Sizing the tail without them while measuring pressure with them would let a
+    photo-heavy tail keep several times its budget: the tail reads as cheap,
+    compaction under-delivers, and the retry loop runs out of attempts on a
+    conversation it never actually shrank.
     """
     if not rows:
         return 0
 
+    costs = estimate_row_costs(rows, attachments=attachments)
     retain = config.retain_tokens
     accumulated = 0
     keep_from = len(rows)
     for index in range(len(rows) - 1, -1, -1):
-        accumulated += estimate_message(rows[index])
+        accumulated += costs[index]
         keep_from = index
         if accumulated >= retain:
             break
@@ -192,6 +203,11 @@ def _cap_input(
     better than losing compaction itself.
     """
     budget = config.max_summary_input_tokens
+    # Priced WITHOUT attachments on purpose: the summarization call replays the
+    # stored rows through `history_to_messages`, which does not hydrate, so no
+    # file content reaches it. Charging for content that will not be sent would
+    # trim the span for no reason.
+    #
     # Price each row ONCE. Re-estimating the shrinking suffix on every step
     # would tokenize the same text over and over — quadratic work on exactly the
     # path that runs when a conversation has already grown large.
@@ -313,7 +329,7 @@ async def compact(
             # one — the configured one is what just failed to fit.
             cutoff_in_pending = _align_cutoff(pending, max(0, len(pending) - 2))
         else:
-            cutoff_in_pending = _select_cutoff(pending, config)
+            cutoff_in_pending = _select_cutoff(pending, config, attachments)
         if cutoff_in_pending <= 0:
             logger.info("compaction found nothing safe to fold conv=%s", cid)
             return False
